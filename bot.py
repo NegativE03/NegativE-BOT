@@ -44,24 +44,6 @@ async def on_ready():
 
     await bot.close()
 
-synced = await bot.tree.sync(guild=guild)
-
-print(f"Usunięto wszystkie komendy z serwera.")
-
-    print("=== KOMENDY ===")
-    for cmd in synced:
-        print(cmd.name)
-
-    print("===============")
-
-    print(f"Zalogowano jako {bot.user}")
-
-    await bot.change_presence(
-        activity=discord.Game(
-            name="KACIEJOS - SERWER NAGRYWKOWY"
-        )
-    )
-
     if not update_server_status.is_running():
         update_server_status.start()
 
