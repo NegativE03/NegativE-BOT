@@ -34,6 +34,11 @@ async def on_ready():
 
     synced = await bot.tree.sync(guild=guild)
 
+    print(f"ZSYNCHRONIZOWANO {len(synced)} KOMEND")
+
+for cmd in synced:
+    print(cmd.name)
+
     print("=== KOMENDY ===")
     for cmd in synced:
         print(cmd.name)
@@ -53,7 +58,7 @@ async def on_ready():
 
     if not check_recordings.is_running():
         check_recordings.start()
-        
+
 # /ping
 @bot.tree.command(name="ping", description="Sprawdza opóźnienie bota")
 async def ping(interaction: discord.Interaction):
