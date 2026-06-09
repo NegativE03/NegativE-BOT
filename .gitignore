@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+warnings.json
+vacations.json
+nagrywki.json
