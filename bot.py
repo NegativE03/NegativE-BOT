@@ -32,9 +32,21 @@ async def on_ready():
 
     guild = discord.Object(id=GUILD_ID)
 
-    bot.tree.copy_global_to(guild=guild)
+    # Usuń komendy globalne
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync()
 
-    synced = await bot.tree.sync(guild=guild)
+    # Usuń komendy serwerowe
+    bot.tree.clear_commands(guild=guild)
+    await bot.tree.sync(guild=guild)
+
+    print("Wyczyszczono wszystkie komendy.")
+
+    await bot.close()
+
+synced = await bot.tree.sync(guild=guild)
+
+print(f"Usunięto wszystkie komendy z serwera.")
 
     print("=== KOMENDY ===")
     for cmd in synced:
