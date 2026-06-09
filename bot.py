@@ -38,7 +38,11 @@ async def setup_hook():
 @bot.event
 async def on_ready():
 
-    synced = await bot.tree.sync()
+    guild = discord.Object(id=GUILD_ID)
+
+    bot.tree.copy_global_to(guild=guild)
+
+    synced = await bot.tree.sync(guild=guild)
 
     print(f"ZSYNCHRONIZOWANO {len(synced)} KOMEND")
 
