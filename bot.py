@@ -26,6 +26,14 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+@bot.event
+async def setup_hook():
+    print("SETUP HOOK")
+    print("PRZED SYNC:", len(bot.tree.get_commands()))
+
+    for cmd in bot.tree.get_commands():
+        print(cmd.name)
+
 
 @bot.event
 async def on_ready():
