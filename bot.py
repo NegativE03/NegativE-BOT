@@ -32,17 +32,21 @@ async def on_ready():
 
     guild = discord.Object(id=GUILD_ID)
 
-    # Usuń komendy globalne
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
+    synced = await bot.tree.sync(guild=guild)
 
-    # Usuń komendy serwerowe
-    bot.tree.clear_commands(guild=guild)
-    await bot.tree.sync(guild=guild)
+    print("=== KOMENDY ===")
+    for cmd in synced:
+        print(cmd.name)
 
-    print("Wyczyszczono wszystkie komendy.")
+    print("===============")
 
-    await bot.close()
+    print(f"Zalogowano jako {bot.user}")
+
+    await bot.change_presence(
+        activity=discord.Game(
+            name="KACIEJOS - SERWER NAGRYWKOWY"
+        )
+    )
 
     if not update_server_status.is_running():
         update_server_status.start()
