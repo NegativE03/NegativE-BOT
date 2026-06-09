@@ -38,13 +38,11 @@ async def setup_hook():
 @bot.event
 async def on_ready():
 
-    bot.tree.clear_commands(guild=None)
+    guild = discord.Object(id=GUILD_ID)
 
-    await bot.tree.sync()
+    bot.tree.copy_global_to(guild=guild)
 
-    print("Usunięto globalne komendy.")
-
-    await bot.close()
+    synced = await bot.tree.sync(guild=guild)
 
     print(f"ZSYNCHRONIZOWANO {len(synced)} KOMEND")
 
