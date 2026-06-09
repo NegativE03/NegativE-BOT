@@ -30,13 +30,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
 
-    guild = discord.Object(id=GUILD_ID)
-
-    synced = await bot.tree.sync(guild=guild)
+    synced = await bot.tree.sync()
 
     print(f"ZSYNCHRONIZOWANO {len(synced)} KOMEND")
 
     print("=== KOMENDY ===")
+    for cmd in synced:
+        print(cmd.name)
 
     print("===============")
 
