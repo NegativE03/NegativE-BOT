@@ -15,6 +15,9 @@ load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 
+print("TOKEN:", TOKEN)
+print("ENV KEYS:", list(os.environ.keys()))
+
 GUILD_ID = 1504878677106626630
 
 intents = discord.Intents.default()
