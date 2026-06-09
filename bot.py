@@ -36,12 +36,7 @@ async def on_ready():
 
     print(f"ZSYNCHRONIZOWANO {len(synced)} KOMEND")
 
-for cmd in synced:
-    print(cmd.name)
-
     print("=== KOMENDY ===")
-    for cmd in synced:
-        print(cmd.name)
 
     print("===============")
 
