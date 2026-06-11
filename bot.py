@@ -24,6 +24,9 @@ GUILD_ID = 1504878677106626630
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.reactions = True
+intents.guilds = True
+intents.guild_messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -716,6 +719,8 @@ async def on_message_edit(before, after):
 @bot.event
 async def on_raw_reaction_add(payload):
 
+    print("RAW ADD WYWOŁANE")
+
     if payload.user_id == bot.user.id:
         return
 
@@ -826,6 +831,8 @@ async def on_raw_reaction_add(payload):
 
 @bot.event
 async def on_raw_reaction_remove(payload):
+
+    print("RAW REMOVE WYWOŁANE")
 
     guild = bot.get_guild(payload.guild_id)
 
