@@ -1714,4 +1714,157 @@ async def odwolajnagrywke(
         ephemeral=True
     )
 
+@bot.tree.command(
+    name="przypomnijnagrywke",
+    description="Wysyła ręczne przypomnienie o nagrywce"
+)
+async def przypomnijnagrywke(
+    interaction: discord.Interaction
+):
+
+    if not any(
+        role.id in STAFF_ROLES
+        for role in interaction.user.roles
+    ):
+
+        await interaction.response.send_message(
+            "❌ Nie masz uprawnień.",
+            ephemeral=True
+        )
+
+        return
+
+
+    nagrywki = load_recordings()
+
+    if len(nagrywki) == 0:
+
+        await interaction.response.send_message(
+            "❌ Brak aktywnych nagrywek.",
+            ephemeral=True
+        )
+
+        return
+
+
+    message_id = list(nagrywki.keys())[-1]
+
+    nagrywka = nagrywki[message_id]
+
+    wyslano = 0
+
+
+    for user_id in nagrywka["uczestnicy"]:
+
+        try:
+
+            user = await bot.fetch_user(user_id)
+
+            await user.send(
+                f"⏰ **Przypomnienie!**\n\n"
+                f"🎬 {nagrywka['opis']}\n"
+                f"📅 {nagrywka['data']}\n"
+                f"🕒 {nagrywka['godzina']}\n\n"
+                f"🔊 Kanał:\n"
+                f"<#{NAGRYWKI_VC_ID}>"
+            )
+
+            wyslano += 1
+
+        except:
+            pass
+
+
+    await interaction.response.send_message(
+        f"✅ Wysłano przypomnienie do {wyslano} osób.",
+        ephemeral=True
+    )
+
+@bot.tree.command(
+    name="zakoncznagrywke",
+    description="Kończy aktywną nagrywkę"
+)
+async def zakoncznagrywke(
+    interaction: discord.Interaction
+):
+
+    if not any(
+        role.id in STAFF_ROLES
+        for role in interaction.user.roles
+    ):
+
+        await interaction.response.send_message(
+            "❌ Nie masz uprawnień.",
+            ephemeral=True
+        )
+
+        return
+
+
+    nagrywki = load_recordings()
+
+    if len(nagrywki) == 0:
+
+        await interaction.response.send_message(
+            "❌ Brak aktywnych nagrywek.",
+            ephemeral=True
+        )
+
+        return
+
+
+    message_id = list(nagrywki.keys())[-1]
+
+    nagrywka = nagrywki[message_id]
+
+
+    channel = bot.get_channel(
+        NAGRYWKI_CHANNEL_ID
+    )
+
+
+    try:
+
+        message = await channel.fetch_message(
+            int(message_id)
+        )
+
+        embed = discord.Embed(
+            title="✅ NAGRYWKA ZAKOŃCZONA",
+            color=discord.Color.green()
+        )
+
+        embed.add_field(
+            name="🎬 Nagrywka",
+            value=nagrywka["opis"],
+            inline=False
+        )
+
+        embed.add_field(
+            name="👤 Zakończył",
+            value=interaction.user.mention,
+            inline=False
+        )
+
+        await message.edit(
+            embed=embed,
+            view=None
+        )
+
+    except:
+        pass
+
+
+    del nagrywki[message_id]
+
+    save_recordings(
+        nagrywki
+    )
+
+
+    await interaction.response.send_message(
+        "✅ Nagrywka została zakończona.",
+        ephemeral=True
+    )
+
 bot.run(TOKEN)
