@@ -1408,15 +1408,15 @@ async def check_recordings():
         # PRZYPOMNIENIE 1H PRZED
         if (
             not nagrywka["reminder_sent"]
-            and 3000 <= roznica <= 3600
+            and 0 <= roznica <= 3600
         ):
 
             for user_id in nagrywka["uczestnicy"]:
 
-                user = bot.get_user(user_id)
-
-                if not user:
-                    continue
+            try:
+                user = await bot.fetch_user(user_id)
+                except:
+                continue
 
                 guild = bot.get_guild(GUILD_ID)
 
