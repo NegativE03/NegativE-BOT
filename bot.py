@@ -1411,40 +1411,40 @@ async def check_recordings():
             and 0 <= roznica <= 3600
         ):
 
-        for user_id in nagrywka["uczestnicy"]:
+            for user_id in nagrywka["uczestnicy"]:
 
-        try:
-            user = await bot.fetch_user(user_id)
-        except:
-            continue
+            try:
+                user = await bot.fetch_user(user_id)
+            except:
+                continue
 
-                    guild = bot.get_guild(GUILD_ID)
+                        guild = bot.get_guild(GUILD_ID)
 
-                    member = guild.get_member(user_id)
+                        member = guild.get_member(user_id)
 
-                    if (
-                        member
-                        and any(
-                            role.id == URLOP_ROLE_ID
-                            for role in member.roles
-                        )
-                    ):
-                        continue
+                        if (
+                            member
+                            and any(
+                                role.id == URLOP_ROLE_ID
+                                for role in member.roles
+                            )
+                        ):
+                            continue
 
-                    try:
+                        try:
 
-                        await user.send(
-                            f"⏰ **Przypomnienie!**\n\n"
-                            f"Za godzinę rozpoczyna się nagrywka:\n\n"
-                            f"🎬 {nagrywka['opis']}\n"
-                            f"📅 {nagrywka['data']}\n"
-                            f"🕒 {nagrywka['godzina']}\n\n"
-                            f"🔊 Kanał:\n"
-                            f"<#{NAGRYWKI_VC_ID}>"
-                        )
+                            await user.send(
+                                f"⏰ **Przypomnienie!**\n\n"
+                                f"Za godzinę rozpoczyna się nagrywka:\n\n"
+                                f"🎬 {nagrywka['opis']}\n"
+                                f"📅 {nagrywka['data']}\n"
+                                f"🕒 {nagrywka['godzina']}\n\n"
+                                f"🔊 Kanał:\n"
+                                f"<#{NAGRYWKI_VC_ID}>"
+                            )
 
-                    except:
-                        pass
+                        except:
+                            pass
 
             nagrywka["reminder_sent"] = True
 
