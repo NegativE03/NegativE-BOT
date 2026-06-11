@@ -1411,12 +1411,12 @@ async def check_recordings():
             and 0 <= roznica <= 3600
         ):
 
-            for user_id in nagrywka["uczestnicy"]:
+        for user_id in nagrywka["uczestnicy"]:
 
-            try:
-                user = await bot.fetch_user(user_id)
-                except:
-                continue
+    try:
+        user = await bot.fetch_user(user_id)
+    except:
+        continue
 
                 guild = bot.get_guild(GUILD_ID)
 
