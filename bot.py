@@ -10,6 +10,7 @@ from discord.ui import Button, View, Modal, TextInput, Select
 from discord.ext import tasks
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -1384,12 +1385,23 @@ async def check_recordings():
             nagrywka["timestamp"]
         )
 
-        now = datetime.now()
+        if termin.tzinfo is None:
+            termin = termin.replace(
+                tzinfo=ZoneInfo("Europe/Warsaw")
+            )
+
+        now = datetime.now(
+            ZoneInfo("Europe/Warsaw")
+        )
+
+        roznica = (
+            termin - now
+        ).total_seconds()
 
         # PRZYPOMNIENIE 1H PRZED
         if (
             not nagrywka["reminder_sent"]
-            and 0 <= (termin - now).total_seconds() <= 3600
+            and 3000 <= roznica <= 3600
         ):
 
             for user_id in nagrywka["uczestnicy"]:
