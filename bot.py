@@ -1406,7 +1406,7 @@ async def check_recordings():
         ).total_seconds()
 
         # PRZYPOMNIENIE 1H PRZED
-         if (
+        if (
             not nagrywka["reminder_sent"]
             and 0 <= roznica <= 3600
         ):
