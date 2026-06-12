@@ -1871,16 +1871,27 @@ async def zakoncznagrywke(
     name="naprawurlopy",
     description="Odbudowuje listę urlopów na podstawie ról"
 )
+async def naprawurlopy(
+    interaction: discord.Interaction
+):
 
-async def restore_vacations():
+    if not any(
+        role.id in STAFF_ROLES
+        for role in interaction.user.roles
+    ):
+        await interaction.response.send_message(
+            "❌ Nie masz uprawnień.",
+            ephemeral=True
+        )
+        return
 
-    guild = bot.get_guild(GUILD_ID)
-
-    role = guild.get_role(URLOP_ROLE_ID)
+    role = interaction.guild.get_role(
+        URLOP_ROLE_ID
+    )
 
     vacations = load_vacations()
 
-    changed = False
+    dodano = 0
 
     for member in role.members:
 
@@ -1893,14 +1904,13 @@ async def restore_vacations():
                 ).isoformat()
             }
 
-            changed = True
+            dodano += 1
 
-    if changed:
+    save_vacations(vacations)
 
-        save_vacations(vacations)
-
-        print(
-            f"Odbudowano {len(vacations)} wpisów urlopowych."
-        )
+    await interaction.response.send_message(
+        f"✅ Odbudowano {dodano} urlopów.",
+        ephemeral=True
+    )
 
 bot.run(TOKEN)
