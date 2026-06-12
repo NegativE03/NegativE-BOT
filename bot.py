@@ -1867,4 +1867,40 @@ async def zakoncznagrywke(
         ephemeral=True
     )
 
+@bot.tree.command(
+    name="naprawurlopy",
+    description="Odbudowuje listę urlopów na podstawie ról"
+)
+
+async def restore_vacations():
+
+    guild = bot.get_guild(GUILD_ID)
+
+    role = guild.get_role(URLOP_ROLE_ID)
+
+    vacations = load_vacations()
+
+    changed = False
+
+    for member in role.members:
+
+        if str(member.id) not in vacations:
+
+            vacations[str(member.id)] = {
+                "end": (
+                    datetime.now()
+                    + timedelta(days=30)
+                ).isoformat()
+            }
+
+            changed = True
+
+    if changed:
+
+        save_vacations(vacations)
+
+        print(
+            f"Odbudowano {len(vacations)} wpisów urlopowych."
+        )
+
 bot.run(TOKEN)
