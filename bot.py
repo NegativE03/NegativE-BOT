@@ -11,10 +11,36 @@ from discord.ext import tasks
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
+from pymongo import MongoClient
 
 load_dotenv()
 
+print("MONGO_URI =", os.getenv("MONGO_URI"))
+
+MONGO_URI = os.getenv("MONGO_URI")
+
+mongo = MongoClient(MONGO_URI)
+
+db = mongo["negative_bot"]
+
+vacations_collection = db["vacations"]
+recordings_collection = db["recordings"]
+
+from pymongo.errors import PyMongoError
+
+try:
+    mongo.admin.command("ping")
+    print("✅ MongoDB connected!")
+    print("DB:", db.name)
+    print("Collections:", db.list_collection_names())
+
+except PyMongoError as e:
+    print("❌ MongoDB ERROR:", e)
+
 TOKEN = os.getenv("TOKEN")
+
+print("DB:", db.name)
+print("Collections:", db.list_collection_names())
 
 print("TOKEN:", TOKEN)
 print("ENV KEYS:", list(os.environ.keys()))
@@ -1025,33 +1051,84 @@ NAGRYWKI_VC_ID = 1504922555595882547
 
 def load_vacations():
 
-    if not os.path.exists("vacations.json"):
-        with open("vacations.json", "w") as f:
-            json.dump({}, f)
+    vacations = {}
 
-    with open("vacations.json", "r") as f:
-        return json.load(f)
+    for doc in vacations_collection.find():
+
+        vacations[str(doc["user_id"])] = {
+            "end": doc["end"]
+        }
+
+    return vacations
 
 
 def save_vacations(data):
 
-    with open("vacations.json", "w") as f:
-        json.dump(data, f, indent=4)
+    existing = {
+        str(doc["user_id"])
+        for doc in vacations_collection.find({}, {"user_id": 1})
+    }
+
+    current = set(data.keys())
+
+    for user_id in existing - current:
+        vacations_collection.delete_one({
+            "user_id": int(user_id)
+        })
+
+    for user_id, vacation in data.items():
+
+        vacations_collection.update_one(
+            {
+                "user_id": int(user_id)
+            },
+            {
+                "$set": {
+                    "end": vacation["end"]
+                }
+            },
+            upsert=True
+        )
+        print("SAVE RECORDINGS", data)
 
 def load_recordings():
 
-    if not os.path.exists("nagrywki.json"):
-        with open("nagrywki.json", "w") as f:
-            json.dump({}, f)
+    recordings = {}
 
-    with open("nagrywki.json", "r") as f:
-        return json.load(f)
+    for doc in recordings_collection.find():
+
+        message_id = str(doc.pop("message_id"))
+
+        recordings[message_id] = doc
+
+    return recordings
 
 
 def save_recordings(data):
 
-    with open("nagrywki.json", "w") as f:
-        json.dump(data, f, indent=4)
+    existing = {
+        str(doc["message_id"])
+        for doc in recordings_collection.find({}, {"message_id": 1})
+    }
+
+    current = set(data.keys())
+
+    for message_id in existing - current:
+        recordings_collection.delete_one({
+            "message_id": int(message_id)
+        })
+
+    for message_id, recording in data.items():
+
+        recordings_collection.update_one(
+            {
+                "message_id": int(message_id)
+            },
+            {
+                "$set": recording
+            },
+            upsert=True
+        )
 
 @bot.tree.command(
     name="nadajurlop",
