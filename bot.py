@@ -15,11 +15,15 @@ from pymongo import MongoClient
 
 load_dotenv()
 
-print("MONGO_URI =", os.getenv("MONGO_URI"))
-
 MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError("Brak MONGO_URI w pliku .env")
 
-mongo = MongoClient(MONGO_URI)
+mongo = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=5000
+)
 
 db = mongo["negative_bot"]
 
@@ -38,12 +42,8 @@ except PyMongoError as e:
     print("❌ MongoDB ERROR:", e)
 
 TOKEN = os.getenv("TOKEN")
-
-print("DB:", db.name)
-print("Collections:", db.list_collection_names())
-
-print("TOKEN:", TOKEN)
-print("ENV KEYS:", list(os.environ.keys()))
+if not TOKEN:
+    raise RuntimeError("Brak TOKEN w pliku .env")
 
 GUILD_ID = 1504878677106626630
 
@@ -55,6 +55,26 @@ intents.guilds = True
 intents.guild_messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+async def send_response(interaction: discord.Interaction, *args, **kwargs):
+    """Odpowiada poprawnie niezależnie od tego, czy interakcja była odroczona."""
+    if interaction.response.is_done():
+        return await interaction.followup.send(*args, **kwargs)
+    return await interaction.response.send_message(*args, **kwargs)
+
+async def defer_slow_interaction(interaction: discord.Interaction):
+    """Zapobiega komunikatowi „aplikacja nie odpowiada” dla wolniejszych komend."""
+    await asyncio.sleep(2)
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+    except discord.InteractionResponded:
+        pass
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type is discord.InteractionType.application_command:
+        asyncio.create_task(defer_slow_interaction(interaction))
 
 @bot.event
 async def setup_hook():
@@ -96,10 +116,13 @@ async def on_ready():
     if not check_recordings.is_running():
         check_recordings.start()
 
+    if not check_vacations.is_running():
+        check_vacations.start()
+
 # /ping
 @bot.tree.command(name="ping", description="Sprawdza opóźnienie bota")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message(
+    await send_response(interaction,
         f"🏓 Pong! {round(bot.latency * 1000)}ms"
     )
 
@@ -110,7 +133,7 @@ async def ping(interaction: discord.Interaction):
 async def clear(interaction: discord.Interaction, ilosc: int):
 
     if not interaction.user.guild_permissions.manage_messages:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -139,7 +162,7 @@ async def kick(
 ):
 
     if not interaction.user.guild_permissions.kick_members:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -148,12 +171,12 @@ async def kick(
     try:
         await user.kick(reason=powod)
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             f"👢 {user.mention} został wyrzucony.\nPowód: {powod}"
         )
 
     except discord.Forbidden:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie mogę wyrzucić tego użytkownika. Sprawdź pozycję ról i uprawnienia bota.",
             ephemeral=True
         )
@@ -171,7 +194,7 @@ async def ban(
 ):
 
     if not interaction.user.guild_permissions.ban_members:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -180,12 +203,12 @@ async def ban(
     try:
         await user.ban(reason=powod)
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             f"🔨 {user.mention} został zbanowany.\nPowód: {powod}"
         )
 
     except discord.Forbidden:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie mogę zbanować tego użytkownika. Sprawdź pozycję ról i uprawnienia bota.",
             ephemeral=True
         )
@@ -203,7 +226,7 @@ async def warn(
 ):
 
     if not interaction.user.guild_permissions.moderate_members:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -235,7 +258,7 @@ async def warn(
     except:
         pass
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         f"⚠️ {user.mention} otrzymał ostrzeżenie.\nPowód: **{powod}**"
     )
 
@@ -250,7 +273,7 @@ async def warnings_cmd(
 ):
 
     if not os.path.exists("warnings.json"):
-        await interaction.response.send_message(
+        await send_response(interaction,
             "Brak ostrzeżeń."
         )
         return
@@ -261,7 +284,7 @@ async def warnings_cmd(
     user_id = str(user.id)
 
     if user_id not in warnings or len(warnings[user_id]) == 0:
-        await interaction.response.send_message(
+        await send_response(interaction,
             f"✅ {user.mention} nie ma ostrzeżeń."
         )
         return
@@ -271,7 +294,7 @@ async def warnings_cmd(
     for i, warn in enumerate(warnings[user_id], start=1):
         tekst += f"{i}. {warn}\n"
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         f"⚠️ Ostrzeżenia użytkownika {user.mention}:\n\n{tekst}"
     )
 
@@ -288,14 +311,14 @@ async def unwarn(
 ):
 
     if not interaction.user.guild_permissions.moderate_members:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
         return
 
     if not os.path.exists("warnings.json"):
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Brak ostrzeżeń.",
             ephemeral=True
         )
@@ -307,14 +330,14 @@ async def unwarn(
     user_id = str(user.id)
 
     if user_id not in warnings:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Ten użytkownik nie ma ostrzeżeń.",
             ephemeral=True
         )
         return
 
     if numer < 1 or numer > len(warnings[user_id]):
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nieprawidłowy numer warna.",
             ephemeral=True
         )
@@ -325,7 +348,7 @@ async def unwarn(
     with open("warnings.json", "w") as f:
         json.dump(warnings, f, indent=4)
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         f"✅ Usunięto warna nr {numer} użytkownikowi {user.mention}\nPowód: **{usuniety}**"
     )
 
@@ -437,7 +460,7 @@ class TicketModal(Modal, title="Nowe zgłoszenie"):
             embed=embed
         )
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             f"✅ Ticket utworzony: {channel.mention}",
             ephemeral=True
         )
@@ -459,7 +482,7 @@ async def ticket(interaction: discord.Interaction):
 async def ticketpanel(interaction: discord.Interaction):
 
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -478,7 +501,7 @@ async def ticketpanel(interaction: discord.Interaction):
         embed=embed
     )
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         "✅ Panel wysłany.",
         ephemeral=True
     )
@@ -492,13 +515,13 @@ TICKET_LOG_CHANNEL = 1513601454630240398
 async def zamknij(interaction: discord.Interaction):
 
     if not interaction.channel.name.startswith("ticket-"):
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Ta komenda działa tylko w ticketach.",
             ephemeral=True
         )
         return
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         "🔒 Zamykanie ticketa..."
     )
 
@@ -568,8 +591,7 @@ async def update_server_status():
     )
 
     servers = {
-        "Kaciej-Nowy": "83.168.68.62:30250",
-        "Kaciej-Ściganci": "83.168.68.62:30200"
+        "Kaciej-Arcade": "83.168.68.62:30200"
     }
 
     async with aiohttp.ClientSession() as session:
@@ -613,7 +635,10 @@ async def update_server_status():
                 )
 
     embed.set_footer(
-        text=f"Ostatnia aktualizacja: {datetime.now().strftime('%H:%M:%S')}"
+        text=(
+            "Ostatnia aktualizacja: "
+            f"{datetime.now(ZoneInfo('Europe/Warsaw')).strftime('%H:%M:%S')}"
+        )
     )
 
     global STATUS_MESSAGE_ID
@@ -1048,6 +1073,71 @@ VACATION_LOG_CHANNEL_ID = 1513887745511264369
 NAGRYWKI_CHANNEL_ID = 1504917763737518282
 NAGRYWKI_LOGS_CHANNEL_ID = 1513890500296577156
 NAGRYWKI_VC_ID = 1504922555595882547
+NIEOBECNOSCI_FORUM_IDS = (
+    1504918682642419712,
+    1504918725478977607
+)
+REPORT_CHANNEL_ID = 1543600442766794753
+NAGRYWKOWICZE_ROLE_ID = 1504910374963511316
+TESTOWI_ROLE_ID = 1504911316173717625
+
+async def find_recording_forum_threads(nagrywka):
+    """Odzyskuje posty także dla nagrywek utworzonych przed zapisem ich ID."""
+    saved_ids = [int(thread_id) for thread_id in nagrywka.get("forum_thread_ids", [])]
+    if saved_ids:
+        return saved_ids
+
+    expected_name = (
+        f"Nagrywka {nagrywka['data']} {nagrywka['godzina']} — {nagrywka['opis']}"
+    )[:100]
+    found_ids = []
+
+    for forum_id in NIEOBECNOSCI_FORUM_IDS:
+        forum = bot.get_channel(forum_id)
+        if not isinstance(forum, discord.ForumChannel):
+            continue
+
+        matching_thread = next(
+            (thread for thread in forum.threads if thread.name == expected_name),
+            None
+        )
+
+        if matching_thread is None:
+            try:
+                async for thread in forum.archived_threads(limit=100):
+                    if thread.name == expected_name:
+                        matching_thread = thread
+                        break
+            except discord.HTTPException as error:
+                print(f"❌ Nie udało się przejrzeć archiwum forum {forum_id}: {error}")
+
+        if matching_thread is not None:
+            found_ids.append(matching_thread.id)
+
+    return found_ids
+
+async def collect_absence_authors(thread_ids):
+    authors_by_forum = {forum_id: set() for forum_id in NIEOBECNOSCI_FORUM_IDS}
+
+    for thread_id in thread_ids:
+        thread = bot.get_channel(int(thread_id))
+        if thread is None:
+            try:
+                thread = await bot.fetch_channel(int(thread_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+
+        if not isinstance(thread, discord.Thread):
+            continue
+
+        try:
+            async for message in thread.history(limit=None, oldest_first=True):
+                if not message.author.bot:
+                    authors_by_forum.setdefault(thread.parent_id, set()).add(message.author.id)
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Nie udało się odczytać nieobecności z postu {thread_id}: {error}")
+
+    return authors_by_forum
 
 def load_vacations():
 
@@ -1151,7 +1241,7 @@ async def nadajurlop(
         role.id in STAFF_ROLES
         for role in interaction.user.roles
     ):
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -1160,13 +1250,21 @@ async def nadajurlop(
     role = interaction.guild.get_role(URLOP_ROLE_ID)
 
     if role in user.roles:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Ten nagrywkowicz jest już na urlopie.",
             ephemeral=True
         )
         return
 
-    end_date = datetime.now() + timedelta(days=dni)
+    if dni < 1:
+        await send_response(
+            interaction,
+            "❌ Liczba dni urlopu musi być większa od zera.",
+            ephemeral=True
+        )
+        return
+
+    end_date = datetime.now(ZoneInfo("Europe/Warsaw")) + timedelta(days=dni)
 
     await user.add_roles(role)
 
@@ -1235,7 +1333,7 @@ async def urlopy(interaction: discord.Interaction):
     vacations = load_vacations()
 
     if len(vacations) == 0:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "📋 Brak aktywnych urlopów."
         )
         return
@@ -1257,7 +1355,7 @@ async def urlopy(interaction: discord.Interaction):
             f"⏰ {koniec.strftime('%d.%m.%Y %H:%M')}\n\n"
         )
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         f"📋 **Aktywne urlopy:**\n\n{tekst}"
     )
 
@@ -1281,7 +1379,7 @@ async def zakonczurlop(
         role.id in STAFF_ROLES
         for role in interaction.user.roles
     ):
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -1290,7 +1388,7 @@ async def zakonczurlop(
     vacations = load_vacations()
 
     if str(user.id) not in vacations:
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Ten nagrywkowicz nie jest na urlopie.",
             ephemeral=True
         )
@@ -1341,6 +1439,61 @@ async def zakonczurlop(
         ephemeral=True
     )
 
+@tasks.loop(minutes=1)
+async def check_vacations():
+    """Zdejmuje rolę urlopową po terminie i usuwa wpis z MongoDB."""
+    vacations = await asyncio.to_thread(load_vacations)
+    if not vacations:
+        return
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+
+    role = guild.get_role(URLOP_ROLE_ID)
+    if role is None:
+        print("❌ Nie znaleziono roli urlopowej")
+        return
+
+    now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    changed = False
+
+    for user_id, data in list(vacations.items()):
+        try:
+            end_date = datetime.fromisoformat(data["end"])
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+        except (KeyError, TypeError, ValueError):
+            print(f"❌ Nieprawidłowa data urlopu dla użytkownika {user_id}")
+            continue
+
+        if end_date > now:
+            continue
+
+        member = guild.get_member(int(user_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+
+        if member is not None and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="Automatyczne zakończenie urlopu")
+                try:
+                    await member.send("🔔 Twój urlop dobiegł końca. Rola urlopowa została zdjęta.")
+                except discord.HTTPException:
+                    pass
+            except discord.HTTPException as error:
+                print(f"❌ Nie udało się zdjąć roli urlopowej użytkownikowi {user_id}: {error}")
+                continue
+
+        del vacations[user_id]
+        changed = True
+
+    if changed:
+        await asyncio.to_thread(save_vacations, vacations)
+
 @bot.tree.command(
     name="nagrywka",
     description="Tworzy termin nagrywki"
@@ -1375,7 +1528,7 @@ async def nagrywka(
         termin = datetime.strptime(
             f"{data} {godzina}",
             "%d.%m.%Y %H:%M"
-        )
+        ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
 
     except ValueError:
 
@@ -1436,6 +1589,34 @@ async def nagrywka(
 
     await message.add_reaction("✅")
 
+    post_title = f"Nagrywka {data} {godzina} — {opis}"[:100]
+    post_content = (
+        "🎬 **Termin nagrywki**\n\n"
+        f"📝 **Opis:** {opis}\n"
+        f"📅 **Data:** {data}\n"
+        f"🕒 **Godzina:** {godzina} (Europe/Warsaw)\n"
+        f"🔊 **Kanał VC:** <#{NAGRYWKI_VC_ID}>\n\n"
+        "Jeżeli nie możesz pojawić się na nagrywce, zgłoś swoją nieobecność w tym poście."
+    )
+
+    forum_thread_ids = []
+
+    for forum_id in NIEOBECNOSCI_FORUM_IDS:
+        forum = bot.get_channel(forum_id)
+        if not isinstance(forum, discord.ForumChannel):
+            print(f"❌ Nie znaleziono forum nieobecności: {forum_id}")
+            continue
+
+        try:
+            created_post = await forum.create_thread(
+                name=post_title,
+                content=post_content,
+                reason=f"Automatyczny post dla nagrywki utworzonej przez {interaction.user}"
+            )
+            forum_thread_ids.append(created_post.thread.id)
+        except discord.HTTPException as error:
+            print(f"❌ Nie udało się utworzyć postu na forum {forum_id}: {error}")
+
     nagrywki = load_recordings()
 
     nagrywki[str(message.id)] = {
@@ -1445,7 +1626,10 @@ async def nagrywka(
         "timestamp": termin.isoformat(),
         "uczestnicy": [],
         "reminder_sent": False,
-        "started": False
+        "started": False,
+        "forum_thread_ids": forum_thread_ids,
+        "forums_closed": False,
+        "report_sent": False
     }
 
     save_recordings(nagrywki)
@@ -1482,20 +1666,119 @@ async def check_recordings():
             termin - now
         ).total_seconds()
 
+        # ZAMKNIĘCIE I ZABLOKOWANIE POSTÓW 3H PRZED NAGRYWKĄ
+        if roznica <= 10800 and not nagrywka.get("forums_closed", False):
+            forum_thread_ids = nagrywka.get("forum_thread_ids", [])
+            all_forums_closed = True
+
+            for thread_id in forum_thread_ids:
+                thread = bot.get_channel(int(thread_id))
+
+                if thread is None:
+                    try:
+                        thread = await bot.fetch_channel(int(thread_id))
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                        print(f"❌ Nie udało się pobrać postu forum {thread_id}: {error}")
+                        all_forums_closed = False
+                        continue
+
+                if not isinstance(thread, discord.Thread):
+                    print(f"❌ Kanał {thread_id} nie jest postem forum")
+                    all_forums_closed = False
+                    continue
+
+                try:
+                    await thread.edit(
+                        archived=True,
+                        locked=True,
+                        reason="Automatyczne zamknięcie 3 godziny przed nagrywką (Europe/Warsaw)"
+                    )
+                except (discord.Forbidden, discord.HTTPException) as error:
+                    print(f"❌ Nie udało się zamknąć postu forum {thread_id}: {error}")
+                    all_forums_closed = False
+
+            if all_forums_closed:
+                nagrywka["forums_closed"] = True
+                changed = True
+
         # PRZYPOMNIENIE 1H PRZED
         if (
             not nagrywka["reminder_sent"]
             and 0 <= roznica <= 3600
         ):
 
+            guild = bot.get_guild(GUILD_ID)
+            forum_thread_ids = await find_recording_forum_threads(nagrywka)
+
+            if forum_thread_ids != nagrywka.get("forum_thread_ids", []):
+                nagrywka["forum_thread_ids"] = forum_thread_ids
+                if forum_thread_ids:
+                    nagrywka["forums_closed"] = False
+                changed = True
+
+            absence_authors = await collect_absence_authors(forum_thread_ids)
+            confirmed_ids = set(nagrywka["uczestnicy"])
+            missing_by_role = {}
+
+            role_forum_pairs = (
+                (NAGRYWKOWICZE_ROLE_ID, NIEOBECNOSCI_FORUM_IDS[0]),
+                (TESTOWI_ROLE_ID, NIEOBECNOSCI_FORUM_IDS[1])
+            )
+
+            if guild is not None:
+                for role_id, forum_id in role_forum_pairs:
+                    role = guild.get_role(role_id)
+                    missing = []
+
+                    if role is not None:
+                        absent_ids = absence_authors.get(forum_id, set())
+                        for member in role.members:
+                            if member.bot:
+                                continue
+                            if member.id in confirmed_ids or member.id in absent_ids:
+                                continue
+                            if any(member_role.id == URLOP_ROLE_ID for member_role in member.roles):
+                                continue
+                            missing.append(member)
+
+                    missing_by_role[role_id] = missing
+
+            if not nagrywka.get("report_sent", False):
+                report_channel = bot.get_channel(REPORT_CHANNEL_ID)
+                if report_channel is not None:
+                    embed = discord.Embed(
+                        title="⚠️ Brak potwierdzenia obecności",
+                        description=(
+                            f"🎬 **{nagrywka['opis']}**\n"
+                            f"📅 {nagrywka['data']} o {nagrywka['godzina']} "
+                            "(Europe/Warsaw)\n\n"
+                            "Poniższe osoby nie dały reakcji ✅, nie zgłosiły "
+                            "nieobecności i nie mają aktywnego urlopu."
+                        ),
+                        color=discord.Color.orange()
+                    )
+
+                    for role_id, label in (
+                        (NAGRYWKOWICZE_ROLE_ID, "🎬 Nagrywkowicze"),
+                        (TESTOWI_ROLE_ID, "🧪 Testowi")
+                    ):
+                        members = missing_by_role.get(role_id, [])
+                        value = "\n".join(member.mention for member in members) or "✅ Wszyscy odpowiedzieli"
+                        embed.add_field(name=label, value=value[:1024], inline=False)
+
+                    await report_channel.send(embed=embed)
+                    nagrywka["report_sent"] = True
+                    changed = True
+
             for user_id in nagrywka["uczestnicy"]:
+
+                if guild is None:
+                    break
 
                 try:
                     user = await bot.fetch_user(user_id)
                 except:
                     continue
-
-                guild = bot.get_guild(GUILD_ID)
 
                 member = guild.get_member(user_id)
 
@@ -1665,7 +1948,7 @@ class CancelRecordingSelect(Select):
 
         except:
 
-            await interaction.response.send_message(
+            await send_response(interaction,
                 "❌ Nie udało się odnaleźć wiadomości.",
                 ephemeral=True
             )
@@ -1731,7 +2014,7 @@ class CancelRecordingSelect(Select):
         )
 
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             "✅ Nagrywka została odwołana.",
             ephemeral=True
         )
@@ -1767,7 +2050,7 @@ async def odwolajnagrywke(
         for role in interaction.user.roles
     ):
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -1777,7 +2060,7 @@ async def odwolajnagrywke(
 
     if len(load_recordings()) == 0:
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Brak aktywnych nagrywek.",
             ephemeral=True
         )
@@ -1785,7 +2068,7 @@ async def odwolajnagrywke(
         return
 
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         "🎬 Wybierz nagrywkę:",
         view=CancelRecordingView(),
         ephemeral=True
@@ -1804,7 +2087,7 @@ async def przypomnijnagrywke(
         for role in interaction.user.roles
     ):
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -1816,7 +2099,7 @@ async def przypomnijnagrywke(
 
     if len(nagrywki) == 0:
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Brak aktywnych nagrywek.",
             ephemeral=True
         )
@@ -1852,7 +2135,7 @@ async def przypomnijnagrywke(
             pass
 
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         f"✅ Wysłano przypomnienie do {wyslano} osób.",
         ephemeral=True
     )
@@ -1870,7 +2153,7 @@ async def zakoncznagrywke(
         for role in interaction.user.roles
     ):
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -1882,7 +2165,7 @@ async def zakoncznagrywke(
 
     if len(nagrywki) == 0:
 
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Brak aktywnych nagrywek.",
             ephemeral=True
         )
@@ -1939,7 +2222,7 @@ async def zakoncznagrywke(
     )
 
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         "✅ Nagrywka została zakończona.",
         ephemeral=True
     )
@@ -1956,7 +2239,7 @@ async def naprawurlopy(
         role.id in STAFF_ROLES
         for role in interaction.user.roles
     ):
-        await interaction.response.send_message(
+        await send_response(interaction,
             "❌ Nie masz uprawnień.",
             ephemeral=True
         )
@@ -1976,7 +2259,7 @@ async def naprawurlopy(
 
             vacations[str(member.id)] = {
                 "end": (
-                    datetime.now()
+                    datetime.now(ZoneInfo("Europe/Warsaw"))
                     + timedelta(days=30)
                 ).isoformat()
             }
@@ -1985,7 +2268,7 @@ async def naprawurlopy(
 
     save_vacations(vacations)
 
-    await interaction.response.send_message(
+    await send_response(interaction,
         f"✅ Odbudowano {dodano} urlopów.",
         ephemeral=True
     )
