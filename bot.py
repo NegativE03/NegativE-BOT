@@ -29,6 +29,7 @@ db = mongo["negative_bot"]
 
 vacations_collection = db["vacations"]
 recordings_collection = db["recordings"]
+recording_stats_collection = db["recording_stats"]
 
 from pymongo.errors import PyMongoError
 
@@ -1139,6 +1140,52 @@ async def collect_absence_authors(thread_ids):
 
     return authors_by_forum
 
+async def build_recording_statistics(message_id, nagrywka, guild):
+    thread_ids = await find_recording_forum_threads(nagrywka)
+    absence_authors = await collect_absence_authors(thread_ids)
+    confirmed_ids = set(nagrywka.get("uczestnicy", []))
+
+    eligible_ids = set()
+    absent_ids = set()
+    vacation_ids = set()
+    missing_ids = set()
+
+    for role_id, forum_id in (
+        (NAGRYWKOWICZE_ROLE_ID, NIEOBECNOSCI_FORUM_IDS[0]),
+        (TESTOWI_ROLE_ID, NIEOBECNOSCI_FORUM_IDS[1])
+    ):
+        role = guild.get_role(role_id)
+        if role is None:
+            continue
+
+        forum_absent_ids = absence_authors.get(forum_id, set())
+        for member in role.members:
+            if member.bot:
+                continue
+
+            eligible_ids.add(member.id)
+            if any(member_role.id == URLOP_ROLE_ID for member_role in member.roles):
+                vacation_ids.add(member.id)
+            elif member.id in forum_absent_ids:
+                absent_ids.add(member.id)
+            elif member.id not in confirmed_ids:
+                missing_ids.add(member.id)
+
+    return {
+        "message_id": int(message_id),
+        "opis": nagrywka["opis"],
+        "data": nagrywka["data"],
+        "godzina": nagrywka["godzina"],
+        "timestamp": nagrywka["timestamp"],
+        "archived_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat(),
+        "eligible_ids": sorted(eligible_ids),
+        "confirmed_ids": sorted(confirmed_ids & eligible_ids),
+        "absent_ids": sorted(absent_ids),
+        "vacation_ids": sorted(vacation_ids),
+        "missing_ids": sorted(missing_ids),
+        "forum_thread_ids": thread_ids
+    }
+
 def load_vacations():
 
     vacations = {}
@@ -2214,6 +2261,15 @@ async def zakoncznagrywke(
     except:
         pass
 
+    guild = bot.get_guild(GUILD_ID)
+    if guild is not None:
+        statistics = await build_recording_statistics(message_id, nagrywka, guild)
+        await asyncio.to_thread(
+            recording_stats_collection.update_one,
+            {"message_id": int(message_id)},
+            {"$set": statistics},
+            True
+        )
 
     del nagrywki[message_id]
 
@@ -2226,6 +2282,78 @@ async def zakoncznagrywke(
         "✅ Nagrywka została zakończona.",
         ephemeral=True
     )
+
+@bot.tree.command(
+    name="statystyki",
+    description="Pokazuje statystyki zakończonych nagrywek"
+)
+@app_commands.describe(user="Opcjonalnie: statystyki konkretnej osoby")
+async def statystyki(
+    interaction: discord.Interaction,
+    user: discord.Member = None
+):
+    documents = await asyncio.to_thread(
+        lambda: list(recording_stats_collection.find().sort("timestamp", 1))
+    )
+
+    if not documents:
+        await send_response(
+            interaction,
+            "📊 Brak zakończonych nagrywek w statystykach.",
+            ephemeral=True
+        )
+        return
+
+    if user is not None:
+        total = sum(user.id in doc.get("eligible_ids", []) for doc in documents)
+        confirmed = sum(user.id in doc.get("confirmed_ids", []) for doc in documents)
+        absent = sum(user.id in doc.get("absent_ids", []) for doc in documents)
+        vacations = sum(user.id in doc.get("vacation_ids", []) for doc in documents)
+        missing = sum(user.id in doc.get("missing_ids", []) for doc in documents)
+        attendance = round((confirmed / total) * 100, 1) if total else 0
+
+        embed = discord.Embed(
+            title=f"📊 Statystyki — {user.display_name}",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Nagrywki", value=str(total), inline=True)
+        embed.add_field(name="✅ Potwierdzone", value=str(confirmed), inline=True)
+        embed.add_field(name="📈 Frekwencja", value=f"{attendance}%", inline=True)
+        embed.add_field(name="📝 Nieobecności", value=str(absent), inline=True)
+        embed.add_field(name="🏖️ Urlopy", value=str(vacations), inline=True)
+        embed.add_field(name="⚠️ Bez odpowiedzi", value=str(missing), inline=True)
+    else:
+        confirmed = sum(len(doc.get("confirmed_ids", [])) for doc in documents)
+        absent = sum(len(doc.get("absent_ids", [])) for doc in documents)
+        vacations = sum(len(doc.get("vacation_ids", [])) for doc in documents)
+        missing = sum(len(doc.get("missing_ids", [])) for doc in documents)
+
+        missing_counts = {}
+        for doc in documents:
+            for user_id in doc.get("missing_ids", []):
+                missing_counts[user_id] = missing_counts.get(user_id, 0) + 1
+
+        ranking = sorted(missing_counts.items(), key=lambda item: item[1], reverse=True)[:10]
+        ranking_text = "\n".join(
+            f"<@{user_id}> — {count}" for user_id, count in ranking
+        ) or "Brak nieusprawiedliwionych nieobecności"
+
+        embed = discord.Embed(
+            title="📊 Statystyki nagrywek",
+            description=f"Zarchiwizowane nagrywki: **{len(documents)}**",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="✅ Potwierdzenia", value=str(confirmed), inline=True)
+        embed.add_field(name="📝 Nieobecności", value=str(absent), inline=True)
+        embed.add_field(name="🏖️ Urlopy", value=str(vacations), inline=True)
+        embed.add_field(name="⚠️ Bez odpowiedzi", value=str(missing), inline=True)
+        embed.add_field(
+            name="Najwięcej braków odpowiedzi",
+            value=ranking_text,
+            inline=False
+        )
+
+    await send_response(interaction, embed=embed)
 
 @bot.tree.command(
     name="naprawurlopy",
