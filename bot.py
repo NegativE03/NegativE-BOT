@@ -3382,7 +3382,12 @@ class DayMemberRecordingSelect(Select):
         candidates = []
         for user_id in document.get("confirmed_ids", []):
             member = interaction.guild.get_member(int(user_id))
-            if member and not member.bot and any(role.id in allowed_role_ids for role in member.roles):
+            if (
+                member
+                and not member.bot
+                and member.id != BOSS_USER_ID
+                and any(role.id in allowed_role_ids for role in member.roles)
+            ):
                 candidates.append(member.id)
 
         candidates = list(dict.fromkeys(candidates))
