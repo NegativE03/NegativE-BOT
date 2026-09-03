@@ -87,6 +87,7 @@ async def setup_hook():
         print(cmd.name)
 
     await restore_day_member_poll_views()
+    bot.add_view(PersonalStatsView())
 
 
 @bot.event
@@ -125,6 +126,8 @@ async def on_ready():
 
     if not check_day_member_polls.is_running():
         check_day_member_polls.start()
+
+    await ensure_personal_stats_panel()
 
 # /ping
 @bot.tree.command(name="ping", description="Sprawdza opóźnienie bota")
@@ -594,7 +597,6 @@ async def update_server_status():
 
     async with aiohttp.ClientSession() as session:
         try:
-            request_started = datetime.now()
             async with session.get(
                 f"http://{server_address}/players.json",
                 timeout=aiohttp.ClientTimeout(total=5)
@@ -609,7 +611,6 @@ async def update_server_status():
                 response.raise_for_status()
                 info = await response.json(content_type=None)
 
-            latency_ms = max(1, round((datetime.now() - request_started).total_seconds() * 1000))
             max_clients_raw = info.get("vars", {}).get("sv_maxClients", "?")
             try:
                 max_clients = int(max_clients_raw)
@@ -634,7 +635,11 @@ async def update_server_status():
                 timestamp=now
             )
             embed.add_field(name="👥 Gracze online", value=player_value, inline=False)
-            embed.add_field(name="📡 Odpowiedź serwera", value=f"**{latency_ms} ms**", inline=True)
+            embed.add_field(
+                name="🚀 Jak dołączyć?",
+                value="Skopiuj i wklej w konsoli **F8**:\n```connect kaciejarcade.tknagrywki.pl```",
+                inline=False
+            )
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
             print(f"❌ Kaciej Arcade status error: {error}")
             embed = discord.Embed(
@@ -1054,19 +1059,73 @@ async def on_voice_state_update(member, before, after):
         now = datetime.now(ZoneInfo("Europe/Warsaw"))
 
         for nagrywka in nagrywki.values():
-            if not nagrywka.get("started", False):
-                continue
-
             joined_at = nagrywka.setdefault("voice_joined_at", {})
             voice_seconds = nagrywka.setdefault("voice_seconds", {})
+            first_joined_at = nagrywka.setdefault("first_voice_join_at", {})
             user_key = str(member.id)
 
+            try:
+                termin = datetime.fromisoformat(nagrywka["timestamp"])
+                if termin.tzinfo is None:
+                    termin = termin.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+            except (KeyError, TypeError, ValueError):
+                continue
+
             if after.channel and after.channel.id == NAGRYWKI_VC_ID:
-                if user_key not in joined_at:
+                tracking_window_started = now >= termin - timedelta(hours=3)
+                recording_not_finished = now <= termin + timedelta(
+                    minutes=nagrywka.get("duration_minutes", 90)
+                )
+                is_first_entry = user_key not in first_joined_at
+                if tracking_window_started and recording_not_finished and is_first_entry:
+                    first_joined_at[user_key] = now.isoformat()
+                    tracking_changed = True
+
+                    if (
+                        now > termin
+                        and not member.bot
+                        and any(
+                            role.id in {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
+                            for role in member.roles
+                        )
+                    ):
+                        late_seconds = int((now - termin).total_seconds())
+                        late_minutes = (late_seconds + 59) // 60
+                        late_log_channel = bot.get_channel(LATE_EXIT_LOG_CHANNEL_ID)
+                        if late_log_channel:
+                            late_embed = discord.Embed(
+                                title="⏰ Spóźnienie na nagrywkę",
+                                description=f"{member.mention} dołączył po rozpoczęciu nagrywki.",
+                                color=discord.Color.orange(),
+                                timestamp=now
+                            )
+                            late_embed.set_thumbnail(url=member.display_avatar.url)
+                            late_embed.add_field(
+                                name="🎬 Nagrywka",
+                                value=f"**{nagrywka['opis']}**\n{nagrywka['data']} • {nagrywka['godzina']}",
+                                inline=False
+                            )
+                            late_embed.add_field(name="⌛ Spóźnienie", value=f"**{late_minutes} min**", inline=True)
+                            late_embed.add_field(
+                                name="🕒 Pierwsze wejście",
+                                value=f"<t:{int(now.timestamp())}:T>",
+                                inline=True
+                            )
+                            late_embed.set_footer(text=f"ID użytkownika: {member.id}")
+                            await late_log_channel.send(
+                                embed=late_embed,
+                                allowed_mentions=discord.AllowedMentions.none()
+                            )
+
+                if nagrywka.get("started", False) and user_key not in joined_at:
                     joined_at[user_key] = now.isoformat()
                     tracking_changed = True
 
-            if before.channel and before.channel.id == NAGRYWKI_VC_ID:
+            if (
+                nagrywka.get("started", False)
+                and before.channel
+                and before.channel.id == NAGRYWKI_VC_ID
+            ):
                 joined_text = joined_at.pop(user_key, None)
                 if joined_text:
                     joined_time = datetime.fromisoformat(joined_text)
@@ -1075,6 +1134,54 @@ async def on_voice_state_update(member, before, after):
                         int((now - joined_time).total_seconds())
                     )
                     tracking_changed = True
+
+                planned_end = termin + timedelta(minutes=nagrywka.get("duration_minutes", 90))
+                if (
+                    now < planned_end
+                    and not member.bot
+                    and any(
+                        role.id in {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
+                        for role in member.roles
+                    )
+                ):
+                    remaining_seconds = int((planned_end - now).total_seconds())
+                    remaining_minutes = (remaining_seconds + 59) // 60
+                    nagrywka.setdefault("early_exit_events", []).append({
+                        "user_id": member.id,
+                        "left_at": now.isoformat(),
+                        "minutes_before_end": remaining_minutes
+                    })
+                    tracking_changed = True
+
+                    exit_log_channel = bot.get_channel(LATE_EXIT_LOG_CHANNEL_ID)
+                    if exit_log_channel:
+                        exit_embed = discord.Embed(
+                            title="🚪 Wcześniejsze wyjście z nagrywki",
+                            description=f"{member.mention} opuścił kanał przed planowanym końcem.",
+                            color=discord.Color.red(),
+                            timestamp=now
+                        )
+                        exit_embed.set_thumbnail(url=member.display_avatar.url)
+                        exit_embed.add_field(
+                            name="🎬 Nagrywka",
+                            value=f"**{nagrywka['opis']}**\n{nagrywka['data']} • {nagrywka['godzina']}",
+                            inline=False
+                        )
+                        exit_embed.add_field(
+                            name="⏳ Do końca pozostało",
+                            value=f"**{remaining_minutes} min**",
+                            inline=True
+                        )
+                        exit_embed.add_field(
+                            name="🕒 Godzina wyjścia",
+                            value=f"<t:{int(now.timestamp())}:T>",
+                            inline=True
+                        )
+                        exit_embed.set_footer(text=f"ID użytkownika: {member.id}")
+                        await exit_log_channel.send(
+                            embed=exit_embed,
+                            allowed_mentions=discord.AllowedMentions.none()
+                        )
 
         if tracking_changed:
             save_recordings(nagrywki)
@@ -1165,11 +1272,13 @@ VACATION_LOG_CHANNEL_ID = 1513887745511264369
 NAGRYWKI_CHANNEL_ID = 1504917763737518282
 NAGRYWKI_LOGS_CHANNEL_ID = 1513890500296577156
 NAGRYWKI_VC_ID = 1504922555595882547
+LATE_EXIT_LOG_CHANNEL_ID = 1545193551774752859
 NIEOBECNOSCI_FORUM_IDS = (
     1504918682642419712,
     1504918725478977607
 )
 REPORT_CHANNEL_ID = 1543600442766794753
+PERSONAL_STATS_CHANNEL_ID = 1504927664635646104
 NAGRYWKOWICZE_ROLE_ID = 1504910374963511316
 TESTOWI_ROLE_ID = 1504911316173717625
 BOSS_USER_ID = 308263498226597888
@@ -1312,6 +1421,30 @@ async def build_recording_statistics(message_id, nagrywka, guild):
             elif member.id not in confirmed_ids:
                 missing_ids.add(member.id)
 
+    recording_start = datetime.fromisoformat(nagrywka["timestamp"])
+    if recording_start.tzinfo is None:
+        recording_start = recording_start.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+
+    first_entries = {}
+    late_minutes = {}
+    early_minutes = {}
+    for user_id in confirmed_ids & eligible_ids:
+        entry_text = nagrywka.get("first_voice_join_at", {}).get(str(user_id))
+        if not entry_text:
+            continue
+        try:
+            entry_time = datetime.fromisoformat(entry_text)
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+            difference_seconds = int((entry_time - recording_start).total_seconds())
+            first_entries[str(user_id)] = entry_time.isoformat()
+            if difference_seconds > 0:
+                late_minutes[str(user_id)] = (difference_seconds + 59) // 60
+            elif difference_seconds < 0:
+                early_minutes[str(user_id)] = (abs(difference_seconds) + 59) // 60
+        except (TypeError, ValueError):
+            continue
+
     return {
         "message_id": int(message_id),
         "opis": nagrywka["opis"],
@@ -1324,6 +1457,10 @@ async def build_recording_statistics(message_id, nagrywka, guild):
         "absent_ids": sorted(absent_ids),
         "vacation_ids": sorted(vacation_ids),
         "missing_ids": sorted(missing_ids),
+        "first_voice_join_at": first_entries,
+        "late_minutes": late_minutes,
+        "early_minutes": early_minutes,
+        "early_exit_events": nagrywka.get("early_exit_events", []),
         "forum_thread_ids": thread_ids
     }
 
@@ -1822,7 +1959,9 @@ async def nagrywka(
         "report_sent": False,
         "duration_minutes": czas,
         "voice_seconds": {},
-        "voice_joined_at": {}
+        "voice_joined_at": {},
+        "first_voice_join_at": {},
+        "early_exit_events": []
     }
 
     save_recordings(nagrywki)
@@ -2065,11 +2204,13 @@ async def check_recordings():
             nagrywka["started"] = True
             nagrywka.setdefault("voice_seconds", {})
             joined_at = nagrywka.setdefault("voice_joined_at", {})
+            first_joined_at = nagrywka.setdefault("first_voice_join_at", {})
             voice_channel = bot.get_channel(NAGRYWKI_VC_ID)
 
             if isinstance(voice_channel, discord.VoiceChannel):
                 for voice_member in voice_channel.members:
                     joined_at.setdefault(str(voice_member.id), now.isoformat())
+                    first_joined_at.setdefault(str(voice_member.id), now.isoformat())
 
             changed = True
 
@@ -2079,11 +2220,15 @@ async def check_recordings():
         if nagrywka.get("started", False):
             voice_channel = bot.get_channel(NAGRYWKI_VC_ID)
             joined_at = nagrywka.setdefault("voice_joined_at", {})
+            first_joined_at = nagrywka.setdefault("first_voice_join_at", {})
             nagrywka.setdefault("voice_seconds", {})
             if isinstance(voice_channel, discord.VoiceChannel):
                 for voice_member in voice_channel.members:
                     if str(voice_member.id) not in joined_at:
                         joined_at[str(voice_member.id)] = now.isoformat()
+                        changed = True
+                    if str(voice_member.id) not in first_joined_at:
+                        first_joined_at[str(voice_member.id)] = now.isoformat()
                         changed = True
 
         if nagrywka.get("started", False) and now >= automatic_end:
@@ -2728,6 +2873,101 @@ async def zakoncznagrywke(
         "✅ Nagrywka została zakończona.",
         ephemeral=True
     )
+
+class PersonalStatsView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Pokaż moje statystyki",
+        emoji="📊",
+        style=discord.ButtonStyle.primary,
+        custom_id="personal_recording_statistics"
+    )
+    async def show_statistics(self, interaction: discord.Interaction, button: Button):
+        allowed_role_ids = {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
+        if not any(role.id in allowed_role_ids for role in interaction.user.roles):
+            await send_response(
+                interaction,
+                "❌ Ten panel jest dostępny wyłącznie dla pomocników i testowych.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        documents = await asyncio.to_thread(
+            lambda: list(recording_stats_collection.find(
+                {"eligible_ids": interaction.user.id},
+                {"confirmed_ids": 1, "absent_ids": 1, "missing_ids": 1}
+            ))
+        )
+        present = sum(interaction.user.id in doc.get("confirmed_ids", []) for doc in documents)
+        absent = sum(interaction.user.id in doc.get("absent_ids", []) for doc in documents)
+        missing = sum(interaction.user.id in doc.get("missing_ids", []) for doc in documents)
+        required = present + absent + missing
+        attendance = round((present / required) * 100, 1) if required else 0
+
+        embed = discord.Embed(
+            title="📊 Twoje podsumowanie nagrywek",
+            description=f"Prywatne statystyki dla **{interaction.user.display_name}**",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name="✅ Obecności", value=f"**{present}**", inline=True)
+        embed.add_field(name="📝 Nieobecności", value=f"**{absent}**", inline=True)
+        embed.add_field(name="⚠️ Bez odpowiedzi", value=f"**{missing}**", inline=True)
+        embed.add_field(
+            name="📈 Frekwencja",
+            value=f"**{attendance}%**",
+            inline=False
+        )
+        embed.set_footer(text="To podsumowanie jest widoczne tylko dla Ciebie")
+        await send_response(interaction, embed=embed, ephemeral=True)
+
+async def ensure_personal_stats_panel():
+    channel = bot.get_channel(PERSONAL_STATS_CHANNEL_ID)
+    if channel is None:
+        print(f"❌ Nie znaleziono kanału panelu statystyk: {PERSONAL_STATS_CHANNEL_ID}")
+        return
+
+    panel_embed = discord.Embed(
+        title="📊 TWOJE STATYSTYKI NAGRYWEK",
+        description=(
+            "Chcesz sprawdzić swoje aktualne podsumowanie?\n\n"
+            "Kliknij przycisk poniżej, a bot prywatnie pokaże Ci:\n"
+            "✅ liczbę obecności,\n"
+            "📝 liczbę zgłoszonych nieobecności,\n"
+            "⚠️ liczbę braków odpowiedzi,\n"
+            "📈 procent frekwencji."
+        ),
+        color=discord.Color.blurple()
+    )
+    if bot.user:
+        panel_embed.set_thumbnail(url=bot.user.display_avatar.url)
+    panel_embed.set_footer(text="Dane są widoczne wyłącznie dla osoby klikającej przycisk")
+
+    panel_message = None
+    try:
+        async for message in channel.history(limit=25):
+            if (
+                message.author == bot.user
+                and message.embeds
+                and message.embeds[0].title == "📊 TWOJE STATYSTYKI NAGRYWEK"
+            ):
+                panel_message = message
+                break
+
+        if panel_message:
+            await panel_message.edit(embed=panel_embed, view=PersonalStatsView())
+        else:
+            await channel.send(
+                embed=panel_embed,
+                view=PersonalStatsView(),
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"❌ Nie udało się utworzyć panelu statystyk: {error}")
 
 @bot.tree.command(
     name="statystyki",
