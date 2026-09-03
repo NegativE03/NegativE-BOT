@@ -834,10 +834,33 @@ async def on_raw_reaction_add(payload):
                 )
 
                 if nagrywki_log:
+                    log_embed = discord.Embed(
+                        title="✅ Nowe potwierdzenie obecności",
+                        description=f"**{nagrywka['opis']}**",
+                        color=discord.Color.green(),
+                        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+                    )
+                    log_embed.add_field(
+                        name="👤 Uczestnik",
+                        value=member.mention,
+                        inline=True
+                    )
+                    log_embed.add_field(
+                        name="📅 Termin",
+                        value=f"{nagrywka['data']} • {nagrywka['godzina']}",
+                        inline=True
+                    )
+                    log_embed.add_field(
+                        name="👥 Potwierdzone osoby",
+                        value=str(len(nagrywka["uczestnicy"])),
+                        inline=True
+                    )
+                    log_embed.set_thumbnail(url=member.display_avatar.url)
+                    log_embed.set_footer(text=f"ID użytkownika: {member.id}")
 
                     await nagrywki_log.send(
-                        f"➕ {member.mention} zapisał się na nagrywkę:\n"
-                        f"🎬 {nagrywka['opis']}"
+                        embed=log_embed,
+                        allowed_mentions=discord.AllowedMentions.none()
                     )
 
             return
@@ -939,9 +962,34 @@ async def on_raw_reaction_remove(payload):
                         else f"ID: {payload.user_id}"
                     )
 
+                    log_embed = discord.Embed(
+                        title="➖ Wycofano potwierdzenie",
+                        description=f"**{nagrywka['opis']}**",
+                        color=discord.Color.orange(),
+                        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+                    )
+                    log_embed.add_field(
+                        name="👤 Uczestnik",
+                        value=user_text,
+                        inline=True
+                    )
+                    log_embed.add_field(
+                        name="📅 Termin",
+                        value=f"{nagrywka['data']} • {nagrywka['godzina']}",
+                        inline=True
+                    )
+                    log_embed.add_field(
+                        name="👥 Pozostałe potwierdzenia",
+                        value=str(len(nagrywka["uczestnicy"])),
+                        inline=True
+                    )
+                    if member:
+                        log_embed.set_thumbnail(url=member.display_avatar.url)
+                    log_embed.set_footer(text=f"ID użytkownika: {payload.user_id}")
+
                     await nagrywki_log.send(
-                        f"➖ {user_text} wypisał się z nagrywki:\n"
-                        f"🎬 {nagrywka['opis']}"
+                        embed=log_embed,
+                        allowed_mentions=discord.AllowedMentions.none()
                     )
 
             return
@@ -2313,23 +2361,28 @@ class CancelRecordingSelect(Select):
 
             embed = discord.Embed(
                 title="❌ Nagrywka odwołana",
+                description=f"**{nagrywka['opis']}**",
                 color=discord.Color.red()
             )
 
             embed.add_field(
-                name="🎬 Nagrywka",
-                value=nagrywka["opis"],
-                inline=False
+                name="📅 Termin",
+                value=f"{nagrywka['data']} • {nagrywka['godzina']}",
+                inline=True
             )
 
             embed.add_field(
                 name="👤 Odwołał",
                 value=interaction.user.mention,
-                inline=False
+                inline=True
             )
+            embed.timestamp = datetime.now(ZoneInfo("Europe/Warsaw"))
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            embed.set_footer(text=f"ID nagrywki: {message_id}")
 
             await log_channel.send(
-                embed=embed
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none()
             )
 
 
@@ -2732,7 +2785,7 @@ async def statystyki(
         embed.set_thumbnail(url=user.display_avatar.url)
         embed.add_field(
             name="📈 Frekwencja",
-            value=f"## {attendance}%\n`{confirmed}/{required}` wymaganych nagrywek",
+            value=f"**{attendance}%**\n`{confirmed}/{required}` wymaganych nagrywek",
             inline=False
         )
         embed.add_field(name="✅ Obecności", value=f"**{confirmed}**", inline=True)
@@ -2775,9 +2828,9 @@ async def statystyki(
             color=discord.Color.blurple(),
             timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
         )
-        embed.add_field(name="🎬 Nagrywki", value=f"## {len(documents)}", inline=True)
-        embed.add_field(name="✅ Obecności", value=f"## {confirmed}", inline=True)
-        embed.add_field(name="📋 Wymagane", value=f"## {required}", inline=True)
+        embed.add_field(name="🎬 Nagrywki", value=f"**{len(documents)}**", inline=True)
+        embed.add_field(name="✅ Obecności", value=f"**{confirmed}**", inline=True)
+        embed.add_field(name="📋 Wymagane", value=f"**{required}**", inline=True)
         embed.add_field(name="📝 Zgłoszone", value=f"**{absent}**", inline=True)
         embed.add_field(name="🏖️ Urlopy", value=f"**{vacations}**", inline=True)
         embed.add_field(name="⚠️ Bez odpowiedzi", value=f"**{missing}**", inline=True)
