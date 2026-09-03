@@ -30,6 +30,7 @@ db = mongo["negative_bot"]
 vacations_collection = db["vacations"]
 recordings_collection = db["recordings"]
 recording_stats_collection = db["recording_stats"]
+day_member_polls_collection = db["day_member_polls"]
 
 from pymongo.errors import PyMongoError
 
@@ -85,6 +86,8 @@ async def setup_hook():
     for cmd in bot.tree.get_commands():
         print(cmd.name)
 
+    await restore_day_member_poll_views()
+
 
 @bot.event
 async def on_ready():
@@ -119,6 +122,9 @@ async def on_ready():
 
     if not check_vacations.is_running():
         check_vacations.start()
+
+    if not check_day_member_polls.is_running():
+        check_day_member_polls.start()
 
 # /ping
 @bot.tree.command(name="ping", description="Sprawdza opóźnienie bota")
@@ -578,98 +584,104 @@ async def zamknij(interaction: discord.Interaction):
 
 @tasks.loop(minutes=3)
 async def update_server_status():
-
     print("STATUS LOOP START")
-
     channel = bot.get_channel(STATUS_CHANNEL_ID)
-
     if not channel:
         return
-
-    embed = discord.Embed(
-        title="🎮 STATUS SERWERÓW KACIEJOS",
-        color=discord.Color.green()
-    )
-
-    servers = {
-        "Kaciej-Arcade": "83.168.68.62:30200"
-    }
+    server_name = "Kaciej Arcade"
+    server_address = "83.168.68.62:30200"
+    now = datetime.now(ZoneInfo("Europe/Warsaw"))
 
     async with aiohttp.ClientSession() as session:
+        try:
+            request_started = datetime.now()
+            async with session.get(
+                f"http://{server_address}/players.json",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                response.raise_for_status()
+                players = await response.json(content_type=None)
 
-        for name, ip in servers.items():
+            async with session.get(
+                f"http://{server_address}/info.json",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                response.raise_for_status()
+                info = await response.json(content_type=None)
 
+            latency_ms = max(1, round((datetime.now() - request_started).total_seconds() * 1000))
+            max_clients_raw = info.get("vars", {}).get("sv_maxClients", "?")
             try:
-                async with session.get(
-                    f"http://{ip}/players.json",
-                    timeout=5
-                ) as response:
+                max_clients = int(max_clients_raw)
+            except (TypeError, ValueError):
+                max_clients = None
 
-                    players = await response.json(content_type=None)
+            player_count = len(players)
+            if max_clients:
+                filled = min(10, round((player_count / max_clients) * 10))
+                capacity_bar = "🟩" * filled + "⬛" * (10 - filled)
+                player_value = f"**{player_count} / {max_clients}**\n{capacity_bar}"
+            else:
+                player_value = f"**{player_count} graczy**"
 
-                async with session.get(
-                    f"http://{ip}/info.json",
-                    timeout=5
-                ) as response:
+            embed = discord.Embed(
+                title="🎮 KACIEJ ARCADE",
+                description=(
+                    "### 🟢 SERWER ONLINE\n"
+                    "Serwer działa prawidłowo i jest gotowy do gry."
+                ),
+                color=discord.Color.green(),
+                timestamp=now
+            )
+            embed.add_field(name="👥 Gracze online", value=player_value, inline=False)
+            embed.add_field(name="📡 Odpowiedź serwera", value=f"**{latency_ms} ms**", inline=True)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
+            print(f"❌ Kaciej Arcade status error: {error}")
+            embed = discord.Embed(
+                title="🎮 KACIEJ ARCADE",
+                description=(
+                    "### 🔴 SERWER OFFLINE\n"
+                    "Serwer jest obecnie niedostępny albo nie odpowiada. Spróbuj ponownie później."
+                ),
+                color=discord.Color.red(),
+                timestamp=now
+            )
+            embed.add_field(name="🔧 Status", value="**Brak połączenia**", inline=True)
 
-                    info = await response.json(content_type=None)
-
-                max_clients = info.get(
-                    "vars",
-                    {}
-                ).get(
-                    "sv_maxClients",
-                    "?"
-                )
-
-                embed.add_field(
-                    name=f"🟢 {name}",
-                    value=f"👥 {len(players)}/{max_clients}",
-                    inline=False
-                )
-
-            except Exception:
-                embed.add_field(
-                    name=f"🔴 {name}",
-                    value="Offline",
-                    inline=False
-                )
-
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
     embed.set_footer(
         text=(
-            "Ostatnia aktualizacja: "
-            f"{datetime.now(ZoneInfo('Europe/Warsaw')).strftime('%H:%M:%S')}"
+            "Kaciej Arcade • Automatyczna aktualizacja co 3 minuty • "
+            f"{now.strftime('%d.%m.%Y, %H:%M:%S')}"
         )
     )
 
     global STATUS_MESSAGE_ID
-
     try:
-
+        message = None
         if STATUS_MESSAGE_ID:
-
-            message = await channel.fetch_message(
-                STATUS_MESSAGE_ID
-            )
-
-            await message.edit(
-                embed=embed
-            )
-
+            message = await channel.fetch_message(STATUS_MESSAGE_ID)
         else:
+            async for previous_message in channel.history(limit=25):
+                if (
+                    previous_message.author == bot.user
+                    and previous_message.embeds
+                    and previous_message.embeds[0].title in (
+                        "🎮 KACIEJ ARCADE",
+                        "🎮 STATUS SERWERÓW KACIEJOS"
+                    )
+                ):
+                    message = previous_message
+                    break
 
-            message = await channel.send(
-                embed=embed
-            )
-
-            STATUS_MESSAGE_ID = message.id
-
-    except:
-
-        message = await channel.send(
-            embed=embed
-        )
-
+        if message:
+            await message.edit(embed=embed)
+        else:
+            message = await channel.send(embed=embed)
+        STATUS_MESSAGE_ID = message.id
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        message = await channel.send(embed=embed)
         STATUS_MESSAGE_ID = message.id
 
 # Logi wiadomości
@@ -2844,6 +2856,413 @@ async def statystyki(
         )
 
     await send_response(interaction, embed=embed)
+
+def day_member_poll_embed(poll, guild):
+    candidate_lines = []
+    for position, user_id in enumerate(poll["candidate_ids"], start=1):
+        member = guild.get_member(int(user_id))
+        candidate_lines.append(
+            f"⭐ **{position}.** {member.mention if member else f'<@{user_id}>'}"
+        )
+
+    closes_at = datetime.fromisoformat(poll["closes_at"])
+    embed = discord.Embed(
+        title="🏆 NAGRYWKOWICZ DNIA",
+        description=(
+            "### 🗳️ Głosowanie zostało rozpoczęte!\n"
+            "Wybierz osobę, która Twoim zdaniem najlepiej zaprezentowała się podczas nagrywki."
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    embed.add_field(
+        name="🎬 Nagrywka",
+        value=(
+            f"**{poll['recording_opis']}**\n"
+            f"📅 {poll['recording_data']}  •  🕒 {poll['recording_godzina']}"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name=f"🌟 Kandydaci ({len(candidate_lines)})",
+        value="\n".join(candidate_lines),
+        inline=False
+    )
+    embed.add_field(
+        name="🕛 Zakończenie",
+        value=f"<t:{int(closes_at.timestamp())}:F>\n<t:{int(closes_at.timestamp())}:R>",
+        inline=True
+    )
+    embed.add_field(
+        name="📌 Oddawanie głosu",
+        value="Użyj menu znajdującego się pod wiadomością.",
+        inline=True
+    )
+    embed.add_field(
+        name="⚖️ Zasady głosowania",
+        value=(
+            "• Każda osoba ma **jeden głos**.\n"
+            "• Głos można zmienić do zakończenia ankiety.\n"
+            "• **Nie można głosować na samego siebie.**\n"
+            "• Wyniki pozostają ukryte do końca głosowania."
+        ),
+        inline=False
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="NegativE* • Wyniki pojawią się automatycznie o północy")
+    return embed
+
+class DayMemberVoteSelect(Select):
+    def __init__(self, poll):
+        guild = bot.get_guild(int(poll["guild_id"]))
+        options = []
+        for user_id in poll["candidate_ids"]:
+            member = guild.get_member(int(user_id)) if guild else None
+            saved_name = poll.get("candidate_names", {}).get(str(user_id))
+            options.append(discord.SelectOption(
+                label=(member.display_name if member else saved_name or f"Użytkownik {user_id}")[:100],
+                value=str(user_id),
+                emoji="⭐"
+            ))
+
+        super().__init__(
+            placeholder="Wybierz Nagrywkowicza Dnia...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"day_member_vote:{poll['poll_id']}"
+        )
+        self.poll_id = poll["poll_id"]
+
+    async def callback(self, interaction: discord.Interaction):
+        poll = await asyncio.to_thread(
+            day_member_polls_collection.find_one,
+            {"poll_id": self.poll_id, "closed": False}
+        )
+        if not poll:
+            await send_response(interaction, "❌ To głosowanie jest już zakończone.", ephemeral=True)
+            return
+
+        candidate_id = int(self.values[0])
+        if candidate_id not in poll.get("candidate_ids", []):
+            await send_response(interaction, "❌ Nieprawidłowy kandydat.", ephemeral=True)
+            return
+
+        if candidate_id == interaction.user.id:
+            await send_response(
+                interaction,
+                "❌ Nie możesz zagłosować na samego siebie. Wybierz inną osobę.",
+                ephemeral=True
+            )
+            return
+
+        await asyncio.to_thread(
+            day_member_polls_collection.update_one,
+            {"poll_id": self.poll_id, "closed": False},
+            {"$set": {f"votes.{interaction.user.id}": candidate_id}}
+        )
+        candidate = interaction.guild.get_member(candidate_id)
+        candidate_name = candidate.display_name if candidate else f"ID {candidate_id}"
+        await send_response(
+            interaction,
+            f"✅ Twój głos na **{candidate_name}** został zapisany. Możesz go później zmienić.",
+            ephemeral=True
+        )
+
+class DayMemberVoteView(View):
+    def __init__(self, poll):
+        super().__init__(timeout=None)
+        self.add_item(DayMemberVoteSelect(poll))
+
+async def restore_day_member_poll_views():
+    polls = await asyncio.to_thread(
+        lambda: list(day_member_polls_collection.find({"closed": False}))
+    )
+    for poll in polls:
+        if poll.get("message_id"):
+            bot.add_view(DayMemberVoteView(poll), message_id=int(poll["message_id"]))
+
+async def close_day_member_poll(poll_id, closed_by=None):
+    poll = await asyncio.to_thread(
+        day_member_polls_collection.find_one,
+        {"poll_id": poll_id, "closed": False}
+    )
+    if not poll:
+        return False
+
+    votes = poll.get("votes", {})
+    counts = {int(user_id): 0 for user_id in poll.get("candidate_ids", [])}
+    valid_vote_count = 0
+    for voter_id, candidate_id in votes.items():
+        candidate_id = int(candidate_id)
+        if candidate_id in counts and int(voter_id) != candidate_id:
+            counts[candidate_id] += 1
+            valid_vote_count += 1
+
+    highest = max(counts.values(), default=0)
+    winners = [user_id for user_id, count in counts.items() if count == highest and highest > 0]
+    ranking = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    medals = ("🥇", "🥈", "🥉")
+    ranking_lines = []
+    for position, (user_id, count) in enumerate(ranking, start=1):
+        marker = medals[position - 1] if position <= 3 else f"`{position}.`"
+        if count == 1:
+            vote_word = "głos"
+        elif 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+            vote_word = "głosy"
+        else:
+            vote_word = "głosów"
+        ranking_lines.append(f"{marker} <@{user_id}>  •  **{count} {vote_word}**")
+    ranking_text = "\n".join(ranking_lines) or "Brak kandydatów."
+
+    if not winners:
+        result_text = "### 🗳️ Brak rozstrzygnięcia\nNie oddano żadnego ważnego głosu."
+    elif len(winners) == 1:
+        result_text = f"### 🎉 Zwycięzcą zostaje <@{winners[0]}>!\nGratulacje — zdobywasz tytuł **Nagrywkowicza Dnia**!"
+    else:
+        result_text = "### 🤝 Mamy remis!\nTytuł zdobywają: " + ", ".join(f"<@{user_id}>" for user_id in winners)
+
+    result_embed = discord.Embed(
+        title="🏆 NAGRYWKOWICZ DNIA — WYNIKI",
+        description=result_text,
+        color=discord.Color.gold(),
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    result_embed.add_field(
+        name="🎬 Nagrywka",
+        value=f"**{poll['recording_opis']}**\n{poll['recording_data']} • {poll['recording_godzina']}",
+        inline=False
+    )
+    result_embed.add_field(name="📊 Końcowa klasyfikacja", value=ranking_text[:1024], inline=False)
+    result_embed.add_field(name="🗳️ Ważne głosy", value=f"**{valid_vote_count}**", inline=True)
+    if closed_by:
+        result_embed.add_field(name="🔒 Zakończył", value=closed_by.mention, inline=True)
+    else:
+        result_embed.add_field(name="🕛 Zakończenie", value="Automatycznie o północy", inline=True)
+    if len(winners) == 1:
+        winner = bot.get_user(winners[0])
+        if winner:
+            result_embed.set_thumbnail(url=winner.display_avatar.url)
+    elif bot.user:
+        result_embed.set_thumbnail(url=bot.user.display_avatar.url)
+    result_embed.set_footer(text="NegativE* • Dziękujemy za udział w głosowaniu")
+
+    channel = bot.get_channel(int(poll["channel_id"]))
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(int(poll["channel_id"]))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            channel = None
+
+    if channel is not None:
+        try:
+            message = await channel.fetch_message(int(poll["message_id"]))
+            closed_embed = message.embeds[0] if message.embeds else discord.Embed()
+            closed_embed.title = "🔒 Nagrywkowicz Dnia — głosowanie zakończone"
+            closed_embed.color = discord.Color.dark_grey()
+            await message.edit(embed=closed_embed, view=None)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+        await channel.send(
+            embed=result_embed,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    await asyncio.to_thread(
+        day_member_polls_collection.update_one,
+        {"poll_id": poll_id},
+        {"$set": {
+            "closed": True,
+            "closed_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat(),
+            "winner_ids": winners,
+            "result_counts": {str(user_id): count for user_id, count in counts.items()}
+        }}
+    )
+    return True
+
+@tasks.loop(minutes=1)
+async def check_day_member_polls():
+    now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    polls = await asyncio.to_thread(
+        lambda: list(day_member_polls_collection.find({"closed": False}))
+    )
+    for poll in polls:
+        try:
+            closes_at = datetime.fromisoformat(poll["closes_at"])
+            if closes_at.tzinfo is None:
+                closes_at = closes_at.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+            if now >= closes_at:
+                await close_day_member_poll(poll["poll_id"])
+        except (KeyError, TypeError, ValueError) as error:
+            print(f"❌ Błędne dane ankiety Nagrywkowicza Dnia: {error}")
+
+class DayMemberRecordingSelect(Select):
+    def __init__(self, documents):
+        self.documents = {str(doc["message_id"]): doc for doc in documents}
+        super().__init__(
+            placeholder="Wybierz zakończoną nagrywkę...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=doc.get("opis", "Nagrywka")[:100],
+                    description=f"{doc.get('data', '')} {doc.get('godzina', '')}"[:100],
+                    value=str(doc["message_id"])
+                )
+                for doc in documents[:25]
+            ]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        document = self.documents.get(self.values[0])
+        if not document:
+            await send_response(interaction, "❌ Nie znaleziono nagrywki.", ephemeral=True)
+            return
+
+        allowed_role_ids = {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
+        candidates = []
+        for user_id in document.get("confirmed_ids", []):
+            member = interaction.guild.get_member(int(user_id))
+            if member and not member.bot and any(role.id in allowed_role_ids for role in member.roles):
+                candidates.append(member.id)
+
+        candidates = list(dict.fromkeys(candidates))
+        if not candidates:
+            await send_response(
+                interaction,
+                "❌ Na tej nagrywce nie było żadnego obecnego pomocnika ani testowego.",
+                ephemeral=True
+            )
+            return
+        if len(candidates) > 25:
+            await send_response(interaction, "❌ Ankieta może zawierać maksymalnie 25 osób.", ephemeral=True)
+            return
+
+        now = datetime.now(ZoneInfo("Europe/Warsaw"))
+        closes_at = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        date_key = now.strftime("%Y-%m-%d")
+        existing = await asyncio.to_thread(
+            day_member_polls_collection.find_one,
+            {"guild_id": interaction.guild.id, "date_key": date_key}
+        )
+        if existing:
+            await send_response(interaction, "❌ Ankieta Nagrywkowicza Dnia została już dzisiaj utworzona.", ephemeral=True)
+            return
+
+        poll_id = f"{interaction.guild.id}-{int(now.timestamp() * 1000000)}"
+        poll = {
+            "poll_id": poll_id,
+            "guild_id": interaction.guild.id,
+            "channel_id": interaction.channel.id,
+            "message_id": None,
+            "recording_message_id": int(document["message_id"]),
+            "recording_opis": document.get("opis", "Nagrywka"),
+            "recording_data": document.get("data", "brak daty"),
+            "recording_godzina": document.get("godzina", "brak godziny"),
+            "candidate_ids": candidates,
+            "candidate_names": {
+                str(user_id): interaction.guild.get_member(user_id).display_name
+                for user_id in candidates
+            },
+            "votes": {},
+            "date_key": date_key,
+            "created_at": now.isoformat(),
+            "closes_at": closes_at.isoformat(),
+            "closed": False
+        }
+        await asyncio.to_thread(day_member_polls_collection.insert_one, poll)
+        poll_message = await interaction.channel.send(
+            embed=day_member_poll_embed(poll, interaction.guild),
+            view=DayMemberVoteView(poll),
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        poll["message_id"] = poll_message.id
+        await asyncio.to_thread(
+            day_member_polls_collection.update_one,
+            {"poll_id": poll_id},
+            {"$set": {"message_id": poll_message.id}}
+        )
+        await send_response(interaction, "✅ Ankieta została opublikowana.", ephemeral=True)
+
+class DayMemberRecordingView(View):
+    def __init__(self, documents):
+        super().__init__(timeout=120)
+        self.add_item(DayMemberRecordingSelect(documents))
+
+@bot.tree.command(
+    name="nagrywkowiczdnia",
+    description="Tworzy ankietę Nagrywkowicza Dnia"
+)
+async def nagrywkowiczdnia(interaction: discord.Interaction):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    documents = await asyncio.to_thread(
+        lambda: list(recording_stats_collection.find().sort("timestamp", -1).limit(25))
+    )
+    if not documents:
+        await send_response(interaction, "❌ Brak zakończonych nagrywek.", ephemeral=True)
+        return
+
+    await send_response(
+        interaction,
+        "🎬 Wybierz nagrywkę, dla której chcesz utworzyć ankietę:",
+        view=DayMemberRecordingView(documents),
+        ephemeral=True
+    )
+
+class CloseDayMemberPollSelect(Select):
+    def __init__(self, polls):
+        super().__init__(
+            placeholder="Wybierz ankietę do zakończenia...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=poll.get("recording_opis", "Ankieta")[:100],
+                    description=f"{poll.get('recording_data', '')} • utworzona {poll.get('date_key', '')}"[:100],
+                    value=poll["poll_id"]
+                )
+                for poll in polls[:25]
+            ]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if await close_day_member_poll(self.values[0], interaction.user):
+            await send_response(interaction, "✅ Ankieta została zakończona, a wyniki opublikowane.", ephemeral=True)
+        else:
+            await send_response(interaction, "❌ Ankieta jest już zakończona.", ephemeral=True)
+
+class CloseDayMemberPollView(View):
+    def __init__(self, polls):
+        super().__init__(timeout=120)
+        self.add_item(CloseDayMemberPollSelect(polls))
+
+@bot.tree.command(
+    name="zakoncznagrywkowiczdnia",
+    description="Kończy ankietę Nagrywkowicza Dnia i publikuje wyniki"
+)
+async def zakoncznagrywkowiczdnia(interaction: discord.Interaction):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    polls = await asyncio.to_thread(
+        lambda: list(day_member_polls_collection.find({"guild_id": interaction.guild.id, "closed": False}))
+    )
+    if not polls:
+        await send_response(interaction, "❌ Brak aktywnych ankiet.", ephemeral=True)
+        return
+
+    await send_response(
+        interaction,
+        "🏆 Wybierz ankietę do zakończenia:",
+        view=CloseDayMemberPollView(polls),
+        ephemeral=True
+    )
 
 @bot.tree.command(
     name="naprawurlopy",
