@@ -1282,6 +1282,7 @@ PERSONAL_STATS_CHANNEL_ID = 1504927664635646104
 NAGRYWKOWICZE_ROLE_ID = 1504910374963511316
 TESTOWI_ROLE_ID = 1504911316173717625
 BOSS_USER_ID = 308263498226597888
+KACIEJ_USER_ID = 1042829196747091988
 MIN_VC_ATTENDANCE_SECONDS = 35 * 60
 POLISH_WEEKDAYS = (
     "poniedziałek",
@@ -2885,6 +2886,14 @@ class PersonalStatsView(View):
         custom_id="personal_recording_statistics"
     )
     async def show_statistics(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id == KACIEJ_USER_ID:
+            await send_response(
+                interaction,
+                "👑 **Czego Ty tu szukasz, Olsztyński Książę?**",
+                ephemeral=True
+            )
+            return
+
         allowed_role_ids = {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
         if not any(role.id in allowed_role_ids for role in interaction.user.roles):
             await send_response(
@@ -2978,6 +2987,14 @@ async def statystyki(
     interaction: discord.Interaction,
     user: discord.Member = None
 ):
+    if user is not None and user.id == KACIEJ_USER_ID:
+        await send_response(
+            interaction,
+            "🎬 **Serio? Gdyby go nie było, to nie byłoby nagrywek.**",
+            ephemeral=True
+        )
+        return
+
     if user is not None and user.id == BOSS_USER_ID:
         await send_response(
             interaction,
