@@ -988,6 +988,37 @@ async def on_raw_reaction_remove(payload):
 @bot.event
 async def on_voice_state_update(member, before, after):
 
+    if before.channel != after.channel:
+        nagrywki = load_recordings()
+        tracking_changed = False
+        now = datetime.now(ZoneInfo("Europe/Warsaw"))
+
+        for nagrywka in nagrywki.values():
+            if not nagrywka.get("started", False):
+                continue
+
+            joined_at = nagrywka.setdefault("voice_joined_at", {})
+            voice_seconds = nagrywka.setdefault("voice_seconds", {})
+            user_key = str(member.id)
+
+            if after.channel and after.channel.id == NAGRYWKI_VC_ID:
+                if user_key not in joined_at:
+                    joined_at[user_key] = now.isoformat()
+                    tracking_changed = True
+
+            if before.channel and before.channel.id == NAGRYWKI_VC_ID:
+                joined_text = joined_at.pop(user_key, None)
+                if joined_text:
+                    joined_time = datetime.fromisoformat(joined_text)
+                    voice_seconds[user_key] = voice_seconds.get(user_key, 0) + max(
+                        0,
+                        int((now - joined_time).total_seconds())
+                    )
+                    tracking_changed = True
+
+        if tracking_changed:
+            save_recordings(nagrywki)
+
     log_channel = bot.get_channel(VC_LOGS_CHANNEL_ID)
 
     if not log_channel:
@@ -1081,6 +1112,48 @@ NIEOBECNOSCI_FORUM_IDS = (
 REPORT_CHANNEL_ID = 1543600442766794753
 NAGRYWKOWICZE_ROLE_ID = 1504910374963511316
 TESTOWI_ROLE_ID = 1504911316173717625
+BOSS_USER_ID = 308263498226597888
+MIN_VC_ATTENDANCE_SECONDS = 35 * 60
+POLISH_WEEKDAYS = (
+    "poniedziałek",
+    "wtorek",
+    "środa",
+    "czwartek",
+    "piątek",
+    "sobota",
+    "niedziela"
+)
+
+def recording_forum_title(date_text):
+    recording_date = datetime.strptime(date_text, "%d.%m.%Y")
+    weekday = POLISH_WEEKDAYS[recording_date.weekday()]
+    return f"Nieobecność {date_text} — {weekday}"
+
+def recording_forum_content(opis, data, godzina, duration):
+    return (
+        "🎬 **Termin nagrywki**\n\n"
+        f"📝 **Opis:** {opis}\n"
+        f"📅 **Data:** {data}\n"
+        f"🕒 **Godzina:** {godzina} (Europe/Warsaw)\n"
+        f"⏱️ **Planowany czas:** {duration} minut\n"
+        f"🔊 **Kanał VC:** <#{NAGRYWKI_VC_ID}>\n\n"
+        "Jeżeli nie możesz pojawić się na nagrywce, zgłoś swoją nieobecność w tym poście."
+    )
+
+def finalize_voice_sessions(nagrywka, end_time):
+    joined_at = nagrywka.setdefault("voice_joined_at", {})
+    voice_seconds = nagrywka.setdefault("voice_seconds", {})
+
+    for user_key, joined_text in list(joined_at.items()):
+        try:
+            joined_time = datetime.fromisoformat(joined_text)
+            voice_seconds[user_key] = voice_seconds.get(user_key, 0) + max(
+                0,
+                int((end_time - joined_time).total_seconds())
+            )
+        except (TypeError, ValueError):
+            pass
+        del joined_at[user_key]
 
 async def find_recording_forum_threads(nagrywka):
     """Odzyskuje posty także dla nagrywek utworzonych przed zapisem ich ID."""
@@ -1088,9 +1161,13 @@ async def find_recording_forum_threads(nagrywka):
     if saved_ids:
         return saved_ids
 
-    expected_name = (
-        f"Nagrywka {nagrywka['data']} {nagrywka['godzina']} — {nagrywka['opis']}"
-    )[:100]
+    expected_names = {
+        recording_forum_title(nagrywka["data"]),
+        (
+            f"Nagrywka {nagrywka['data']} {nagrywka['godzina']} — "
+            f"{nagrywka['opis']}"
+        )[:100]
+    }
     found_ids = []
 
     for forum_id in NIEOBECNOSCI_FORUM_IDS:
@@ -1099,14 +1176,14 @@ async def find_recording_forum_threads(nagrywka):
             continue
 
         matching_thread = next(
-            (thread for thread in forum.threads if thread.name == expected_name),
+            (thread for thread in forum.threads if thread.name in expected_names),
             None
         )
 
         if matching_thread is None:
             try:
                 async for thread in forum.archived_threads(limit=100):
-                    if thread.name == expected_name:
+                    if thread.name in expected_names:
                         matching_thread = thread
                         break
             except discord.HTTPException as error:
@@ -1143,7 +1220,11 @@ async def collect_absence_authors(thread_ids):
 async def build_recording_statistics(message_id, nagrywka, guild):
     thread_ids = await find_recording_forum_threads(nagrywka)
     absence_authors = await collect_absence_authors(thread_ids)
-    confirmed_ids = set(nagrywka.get("uczestnicy", []))
+    confirmed_ids = {
+        int(user_id)
+        for user_id, seconds in nagrywka.get("voice_seconds", {}).items()
+        if seconds >= MIN_VC_ATTENDANCE_SECONDS
+    }
 
     eligible_ids = set()
     absent_ids = set()
@@ -1548,13 +1629,15 @@ async def check_vacations():
 @app_commands.describe(
     opis="Opis nagrywki",
     data="Data (DD.MM.RRRR)",
-    godzina="Godzina (HH:MM)"
+    godzina="Godzina (HH:MM)",
+    czas="Planowany czas nagrywki w minutach"
 )
 async def nagrywka(
     interaction: discord.Interaction,
     opis: str,
     data: str,
-    godzina: str
+    godzina: str,
+    czas: int = 90
 ):
 
     await interaction.response.defer(
@@ -1587,6 +1670,13 @@ async def nagrywka(
 
         return
 
+    if czas < 35 or czas > 720:
+        await interaction.followup.send(
+            "❌ Czas nagrywki musi wynosić od 35 do 720 minut.",
+            ephemeral=True
+        )
+        return
+
     channel = bot.get_channel(
         NAGRYWKI_CHANNEL_ID
     )
@@ -1610,7 +1700,7 @@ async def nagrywka(
 
     embed.add_field(
         name="🕒 Godzina",
-        value=godzina,
+        value=f"{godzina}\n⏱️ {czas} min",
         inline=True
     )
 
@@ -1636,15 +1726,8 @@ async def nagrywka(
 
     await message.add_reaction("✅")
 
-    post_title = f"Nagrywka {data} {godzina} — {opis}"[:100]
-    post_content = (
-        "🎬 **Termin nagrywki**\n\n"
-        f"📝 **Opis:** {opis}\n"
-        f"📅 **Data:** {data}\n"
-        f"🕒 **Godzina:** {godzina} (Europe/Warsaw)\n"
-        f"🔊 **Kanał VC:** <#{NAGRYWKI_VC_ID}>\n\n"
-        "Jeżeli nie możesz pojawić się na nagrywce, zgłoś swoją nieobecność w tym poście."
-    )
+    post_title = recording_forum_title(data)
+    post_content = recording_forum_content(opis, data, godzina, czas)
 
     forum_thread_ids = []
 
@@ -1676,7 +1759,10 @@ async def nagrywka(
         "started": False,
         "forum_thread_ids": forum_thread_ids,
         "forums_closed": False,
-        "report_sent": False
+        "report_sent": False,
+        "duration_minutes": czas,
+        "voice_seconds": {},
+        "voice_joined_at": {}
     }
 
     save_recordings(nagrywki)
@@ -1694,7 +1780,7 @@ async def check_recordings():
 
     changed = False
 
-    for message_id, nagrywka in nagrywki.items():
+    for message_id, nagrywka in list(nagrywki.items()):
 
         termin = datetime.fromisoformat(
             nagrywka["timestamp"]
@@ -1917,13 +2003,207 @@ async def check_recordings():
 
 
             nagrywka["started"] = True
+            nagrywka.setdefault("voice_seconds", {})
+            joined_at = nagrywka.setdefault("voice_joined_at", {})
+            voice_channel = bot.get_channel(NAGRYWKI_VC_ID)
 
+            if isinstance(voice_channel, discord.VoiceChannel):
+                for voice_member in voice_channel.members:
+                    joined_at.setdefault(str(voice_member.id), now.isoformat())
+
+            changed = True
+
+        duration_minutes = nagrywka.get("duration_minutes", 90)
+        automatic_end = termin + timedelta(minutes=duration_minutes)
+
+        if nagrywka.get("started", False):
+            voice_channel = bot.get_channel(NAGRYWKI_VC_ID)
+            joined_at = nagrywka.setdefault("voice_joined_at", {})
+            nagrywka.setdefault("voice_seconds", {})
+            if isinstance(voice_channel, discord.VoiceChannel):
+                for voice_member in voice_channel.members:
+                    if str(voice_member.id) not in joined_at:
+                        joined_at[str(voice_member.id)] = now.isoformat()
+                        changed = True
+
+        if nagrywka.get("started", False) and now >= automatic_end:
+            finalize_voice_sessions(nagrywka, now)
+            guild = bot.get_guild(GUILD_ID)
+
+            if guild is not None:
+                statistics = await build_recording_statistics(message_id, nagrywka, guild)
+                statistics["ended_automatically"] = True
+                await asyncio.to_thread(
+                    recording_stats_collection.update_one,
+                    {"message_id": int(message_id)},
+                    {"$set": statistics},
+                    True
+                )
+
+            recording_channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+            if recording_channel is not None:
+                try:
+                    message = await recording_channel.fetch_message(int(message_id))
+                    finished_embed = discord.Embed(
+                        title="✅ NAGRYWKA ZAKOŃCZONA AUTOMATYCZNIE",
+                        description=nagrywka["opis"],
+                        color=discord.Color.green()
+                    )
+                    finished_embed.add_field(
+                        name="⏱️ Minimalna obecność",
+                        value="35 minut na kanale VC",
+                        inline=False
+                    )
+                    await message.edit(embed=finished_embed, view=None)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                    print(f"❌ Nie udało się oznaczyć zakończonej nagrywki {message_id}: {error}")
+
+            del nagrywki[message_id]
             changed = True
 
 
     if changed:
 
         save_recordings(nagrywki)
+
+def recording_select_options(nagrywki):
+    return [
+        discord.SelectOption(
+            label=nagrywka["opis"][:50],
+            description=f"{nagrywka['data']} {nagrywka['godzina']}"[:100],
+            value=message_id
+        )
+        for message_id, nagrywka in nagrywki.items()
+    ][:25]
+
+class RecordingActionSelect(Select):
+    def __init__(self, action, user=None):
+        self.action = action
+        self.target_user = user
+        super().__init__(
+            placeholder="Wybierz konkretną nagrywkę...",
+            min_values=1,
+            max_values=1,
+            options=recording_select_options(load_recordings())
+        )
+
+    async def callback(self, interaction):
+        recording_id = self.values[0]
+        if self.action == "remind":
+            await przypomnijnagrywke.callback(interaction, recording_id)
+        elif self.action == "remove":
+            await usunobecnosc.callback(interaction, self.target_user, recording_id)
+        elif self.action == "finish":
+            await zakoncznagrywke.callback(interaction, recording_id)
+        elif self.action == "edit":
+            nagrywka = load_recordings().get(recording_id)
+            if nagrywka:
+                await interaction.response.send_modal(EditRecordingModal(recording_id, nagrywka))
+
+class RecordingActionView(View):
+    def __init__(self, action, user=None):
+        super().__init__(timeout=120)
+        self.add_item(RecordingActionSelect(action, user))
+
+class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
+    opis = TextInput(label="Opis", max_length=1000)
+    data = TextInput(label="Data (DD.MM.RRRR)", max_length=10)
+    godzina = TextInput(label="Godzina (HH:MM)", max_length=5)
+    czas = TextInput(label="Czas w minutach", max_length=3)
+
+    def __init__(self, recording_id, nagrywka):
+        super().__init__()
+        self.recording_id = recording_id
+        self.opis.default = nagrywka["opis"]
+        self.data.default = nagrywka["data"]
+        self.godzina.default = nagrywka["godzina"]
+        self.czas.default = str(nagrywka.get("duration_minutes", 90))
+
+    async def on_submit(self, interaction):
+        try:
+            termin = datetime.strptime(
+                f"{self.data.value} {self.godzina.value}", "%d.%m.%Y %H:%M"
+            ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+            duration = int(self.czas.value)
+            if not 35 <= duration <= 720:
+                raise ValueError
+        except ValueError:
+            await send_response(interaction, "❌ Niepoprawna data, godzina lub czas.", ephemeral=True)
+            return
+
+        nagrywki = load_recordings()
+        nagrywka = nagrywki.get(self.recording_id)
+        if not nagrywka:
+            await send_response(interaction, "❌ Ta nagrywka nie jest już aktywna.", ephemeral=True)
+            return
+
+        nagrywka.update({
+            "opis": self.opis.value,
+            "data": self.data.value,
+            "godzina": self.godzina.value,
+            "timestamp": termin.isoformat(),
+            "duration_minutes": duration,
+            "reminder_sent": False,
+            "report_sent": False,
+            "forums_closed": False
+        })
+        save_recordings(nagrywki)
+
+        channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+        try:
+            message = await channel.fetch_message(int(self.recording_id))
+            embed = message.embeds[0]
+            embed.set_field_at(0, name="📝 Opis", value=self.opis.value, inline=False)
+            embed.set_field_at(1, name="📅 Data", value=self.data.value, inline=True)
+            embed.set_field_at(2, name="🕒 Godzina", value=f"{self.godzina.value}\n⏱️ {duration} min", inline=True)
+            await message.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+        for thread_id in await find_recording_forum_threads(nagrywka):
+            try:
+                thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+                was_archived = thread.archived
+                was_locked = thread.locked
+                if was_archived or was_locked:
+                    await thread.edit(archived=False, locked=False)
+
+                await thread.edit(name=recording_forum_title(self.data.value))
+                starter_message = await thread.fetch_message(thread.id)
+                await starter_message.edit(content=recording_forum_content(
+                    self.opis.value,
+                    self.data.value,
+                    self.godzina.value,
+                    duration
+                ))
+
+                close_time = termin - timedelta(hours=3)
+                if datetime.now(ZoneInfo("Europe/Warsaw")) >= close_time:
+                    await thread.edit(archived=True, locked=True)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        await send_response(interaction, "✅ Nagrywka została zaktualizowana.", ephemeral=True)
+
+@bot.tree.command(
+    name="edytujnagrywke",
+    description="Zmienia termin, opis i czas wybranej nagrywki"
+)
+async def edytujnagrywke(interaction: discord.Interaction):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    if not load_recordings():
+        await send_response(interaction, "❌ Brak aktywnych nagrywek.", ephemeral=True)
+        return
+
+    await send_response(
+        interaction,
+        "🎬 Wybierz nagrywkę do edycji:",
+        view=RecordingActionView("edit"),
+        ephemeral=True
+    )
 
 class CancelRecordingSelect(Select):
 
@@ -2067,15 +2347,6 @@ class CancelRecordingSelect(Select):
         )
 
 class CancelRecordingView(View):
-
-    def __init__(self):
-
-        super().__init__(timeout=60)
-
-        self.add_item(
-            CancelRecordingSelect()
-        )
-
     def __init__(self):
 
         super().__init__(timeout=60)
@@ -2126,7 +2397,8 @@ async def odwolajnagrywke(
     description="Wysyła ręczne przypomnienie o nagrywce"
 )
 async def przypomnijnagrywke(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
+    recording_id: str = None
 ):
 
     if not any(
@@ -2153,10 +2425,21 @@ async def przypomnijnagrywke(
 
         return
 
+    if recording_id is None:
+        await send_response(
+            interaction,
+            "🎬 Wybierz nagrywkę do przypomnienia:",
+            view=RecordingActionView("remind"),
+            ephemeral=True
+        )
+        return
 
-    message_id = list(nagrywki.keys())[-1]
+    message_id = recording_id
 
-    nagrywka = nagrywki[message_id]
+    nagrywka = nagrywki.get(message_id)
+    if nagrywka is None:
+        await send_response(interaction, "❌ Nie znaleziono nagrywki.", ephemeral=True)
+        return
 
     wyslano = 0
 
@@ -2188,11 +2471,95 @@ async def przypomnijnagrywke(
     )
 
 @bot.tree.command(
+    name="usunobecnosc",
+    description="Usuwa potwierdzenie osoby, która nie przyszła na nagrywkę"
+)
+@app_commands.describe(user="Osoba, której potwierdzenie ma zostać usunięte")
+async def usunobecnosc(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    recording_id: str = None
+):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(
+            interaction,
+            "❌ Nie masz uprawnień.",
+            ephemeral=True
+        )
+        return
+
+    nagrywki = load_recordings()
+    if not nagrywki:
+        await send_response(
+            interaction,
+            "❌ Brak aktywnych nagrywek.",
+            ephemeral=True
+        )
+        return
+
+    if recording_id is None:
+        await send_response(
+            interaction,
+            "🎬 Wybierz nagrywkę:",
+            view=RecordingActionView("remove", user),
+            ephemeral=True
+        )
+        return
+
+    message_id = recording_id
+    nagrywka = nagrywki.get(message_id)
+    if nagrywka is None:
+        await send_response(interaction, "❌ Nie znaleziono nagrywki.", ephemeral=True)
+        return
+
+    if user.id not in nagrywka.get("uczestnicy", []):
+        await send_response(
+            interaction,
+            f"❌ {user.mention} nie ma potwierdzonej obecności na tej nagrywce.",
+            ephemeral=True
+        )
+        return
+
+    nagrywka["uczestnicy"].remove(user.id)
+    save_recordings(nagrywki)
+
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    reaction_removed = False
+
+    if channel is not None:
+        try:
+            message = await channel.fetch_message(int(message_id))
+            await message.remove_reaction("✅", user)
+            reaction_removed = True
+
+            if message.embeds:
+                embed = message.embeds[0]
+                embed.set_field_at(
+                    4,
+                    name="✅ Biorę udział",
+                    value=f"{len(nagrywka['uczestnicy'])} osób",
+                    inline=False
+                )
+                await message.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Nie udało się usunąć reakcji użytkownika {user.id}: {error}")
+
+    result = (
+        f"✅ Usunięto potwierdzenie {user.mention}. "
+        "Osoba nie zostanie policzona jako obecna."
+    )
+    if not reaction_removed:
+        result += "\n⚠️ Wpis w bazie usunięto, ale nie udało się usunąć reakcji na Discordzie."
+
+    await send_response(interaction, result, ephemeral=True)
+
+@bot.tree.command(
     name="zakoncznagrywke",
     description="Kończy aktywną nagrywkę"
 )
 async def zakoncznagrywke(
-    interaction: discord.Interaction
+    interaction: discord.Interaction,
+    recording_id: str = None
 ):
 
     if not any(
@@ -2219,10 +2586,20 @@ async def zakoncznagrywke(
 
         return
 
+    if recording_id is None:
+        await send_response(
+            interaction,
+            "🎬 Wybierz nagrywkę do zakończenia:",
+            view=RecordingActionView("finish"),
+            ephemeral=True
+        )
+        return
 
-    message_id = list(nagrywki.keys())[-1]
-
-    nagrywka = nagrywki[message_id]
+    message_id = recording_id
+    nagrywka = nagrywki.get(message_id)
+    if nagrywka is None:
+        await send_response(interaction, "❌ Nie znaleziono nagrywki.", ephemeral=True)
+        return
 
 
     channel = bot.get_channel(
@@ -2263,6 +2640,10 @@ async def zakoncznagrywke(
 
     guild = bot.get_guild(GUILD_ID)
     if guild is not None:
+        finalize_voice_sessions(
+            nagrywka,
+            datetime.now(ZoneInfo("Europe/Warsaw"))
+        )
         statistics = await build_recording_statistics(message_id, nagrywka, guild)
         await asyncio.to_thread(
             recording_stats_collection.update_one,
@@ -2292,6 +2673,14 @@ async def statystyki(
     interaction: discord.Interaction,
     user: discord.Member = None
 ):
+    if user is not None and user.id == BOSS_USER_ID:
+        await send_response(
+            interaction,
+            "🤨 **Szefa chcesz sprawdzać?**",
+            ephemeral=True
+        )
+        return
+
     documents = await asyncio.to_thread(
         lambda: list(recording_stats_collection.find().sort("timestamp", 1))
     )
@@ -2310,23 +2699,61 @@ async def statystyki(
         absent = sum(user.id in doc.get("absent_ids", []) for doc in documents)
         vacations = sum(user.id in doc.get("vacation_ids", []) for doc in documents)
         missing = sum(user.id in doc.get("missing_ids", []) for doc in documents)
-        attendance = round((confirmed / total) * 100, 1) if total else 0
+        required = max(total - vacations, 0)
+        attendance = round((confirmed / required) * 100, 1) if required else 0
+
+        recent_results = []
+        for doc in reversed(documents):
+            if user.id not in doc.get("eligible_ids", []):
+                continue
+            if user.id in doc.get("confirmed_ids", []):
+                status = "✅ Potwierdzona obecność"
+            elif user.id in doc.get("absent_ids", []):
+                status = "📝 Zgłoszona nieobecność"
+            elif user.id in doc.get("vacation_ids", []):
+                status = "🏖️ Urlop"
+            else:
+                status = "⚠️ Brak odpowiedzi"
+            recent_results.append(
+                f"`{doc.get('data', 'brak daty')}` • {status}"
+            )
+            if len(recent_results) == 5:
+                break
 
         embed = discord.Embed(
-            title=f"📊 Statystyki — {user.display_name}",
-            color=discord.Color.blue()
+            title="📊 Karta frekwencji",
+            description=(
+                f"### {user.mention}\n"
+                "Podsumowanie zakończonych nagrywek"
+            ),
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
         )
-        embed.add_field(name="Nagrywki", value=str(total), inline=True)
-        embed.add_field(name="✅ Potwierdzone", value=str(confirmed), inline=True)
-        embed.add_field(name="📈 Frekwencja", value=f"{attendance}%", inline=True)
-        embed.add_field(name="📝 Nieobecności", value=str(absent), inline=True)
-        embed.add_field(name="🏖️ Urlopy", value=str(vacations), inline=True)
-        embed.add_field(name="⚠️ Bez odpowiedzi", value=str(missing), inline=True)
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(
+            name="📈 Frekwencja",
+            value=f"## {attendance}%\n`{confirmed}/{required}` wymaganych nagrywek",
+            inline=False
+        )
+        embed.add_field(name="✅ Obecności", value=f"**{confirmed}**", inline=True)
+        embed.add_field(name="📝 Zgłoszone", value=f"**{absent}**", inline=True)
+        embed.add_field(name="⚠️ Bez odpowiedzi", value=f"**{missing}**", inline=True)
+        embed.add_field(name="🏖️ Urlopy", value=f"**{vacations}**", inline=True)
+        embed.add_field(name="🎬 Wszystkie terminy", value=f"**{total}**", inline=True)
+        embed.add_field(name="📋 Wymagane", value=f"**{required}**", inline=True)
+        embed.add_field(
+            name="🕘 Ostatnie wyniki",
+            value="\n".join(recent_results) or "Brak historii dla tej osoby.",
+            inline=False
+        )
+        embed.set_footer(text="Urlopy nie obniżają procentu frekwencji")
     else:
         confirmed = sum(len(doc.get("confirmed_ids", [])) for doc in documents)
         absent = sum(len(doc.get("absent_ids", [])) for doc in documents)
         vacations = sum(len(doc.get("vacation_ids", [])) for doc in documents)
         missing = sum(len(doc.get("missing_ids", [])) for doc in documents)
+        required = confirmed + absent + missing
+        attendance = round((confirmed / required) * 100, 1) if required else 0
 
         missing_counts = {}
         for doc in documents:
@@ -2335,22 +2762,32 @@ async def statystyki(
 
         ranking = sorted(missing_counts.items(), key=lambda item: item[1], reverse=True)[:10]
         ranking_text = "\n".join(
-            f"<@{user_id}> — {count}" for user_id, count in ranking
-        ) or "Brak nieusprawiedliwionych nieobecności"
+            f"`{position}.` <@{user_id}> — **{count}**"
+            for position, (user_id, count) in enumerate(ranking, start=1)
+        ) or "✅ Brak nieusprawiedliwionych nieobecności"
 
         embed = discord.Embed(
-            title="📊 Statystyki nagrywek",
-            description=f"Zarchiwizowane nagrywki: **{len(documents)}**",
-            color=discord.Color.blue()
+            title="📊 Centrum statystyk nagrywek",
+            description=(
+                f"### Ogólna frekwencja: **{attendance}%**\n"
+                f"Dane z **{len(documents)}** zakończonych nagrywek"
+            ),
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
         )
-        embed.add_field(name="✅ Potwierdzenia", value=str(confirmed), inline=True)
-        embed.add_field(name="📝 Nieobecności", value=str(absent), inline=True)
-        embed.add_field(name="🏖️ Urlopy", value=str(vacations), inline=True)
-        embed.add_field(name="⚠️ Bez odpowiedzi", value=str(missing), inline=True)
+        embed.add_field(name="🎬 Nagrywki", value=f"## {len(documents)}", inline=True)
+        embed.add_field(name="✅ Obecności", value=f"## {confirmed}", inline=True)
+        embed.add_field(name="📋 Wymagane", value=f"## {required}", inline=True)
+        embed.add_field(name="📝 Zgłoszone", value=f"**{absent}**", inline=True)
+        embed.add_field(name="🏖️ Urlopy", value=f"**{vacations}**", inline=True)
+        embed.add_field(name="⚠️ Bez odpowiedzi", value=f"**{missing}**", inline=True)
         embed.add_field(
-            name="Najwięcej braków odpowiedzi",
+            name="🚨 Najwięcej braków odpowiedzi",
             value=ranking_text,
             inline=False
+        )
+        embed.set_footer(
+            text="Użyj /statystyki user:@osoba, aby zobaczyć kartę konkretnej osoby"
         )
 
     await send_response(interaction, embed=embed)
