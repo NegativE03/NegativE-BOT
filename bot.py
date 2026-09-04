@@ -11,7 +11,7 @@ from discord.ext import tasks
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 
 load_dotenv()
 
@@ -31,6 +31,7 @@ vacations_collection = db["vacations"]
 recordings_collection = db["recordings"]
 recording_stats_collection = db["recording_stats"]
 day_member_polls_collection = db["day_member_polls"]
+bot_counters_collection = db["bot_counters"]
 
 from pymongo.errors import PyMongoError
 
@@ -1313,10 +1314,37 @@ def polish_people_word(count):
         return "osoby"
     return "osób"
 
+def recording_display_name(nagrywka):
+    number = nagrywka.get("recording_number")
+    if number is not None:
+        return f"Nagrywka #{number}"
+    return nagrywka.get("opis", "Nagrywka")
+
+def next_recording_number():
+    historical_count = recording_stats_collection.count_documents({})
+    highest_stat = recording_stats_collection.find_one(
+        {"recording_number": {"$exists": True}},
+        sort=[("recording_number", -1)]
+    )
+    base_number = max(
+        historical_count,
+        int(highest_stat.get("recording_number") or 0) if highest_stat else 0
+    )
+    bot_counters_collection.update_one(
+        {"_id": "recording_number"},
+        {"$max": {"value": base_number}},
+        upsert=True
+    )
+    counter = bot_counters_collection.find_one_and_update(
+        {"_id": "recording_number"},
+        {"$inc": {"value": 1}},
+        return_document=ReturnDocument.AFTER
+    )
+    return int(counter["value"])
+
 def recording_forum_content(opis, data, godzina, duration=None):
     return (
         "🎬 **Termin nagrywki**\n\n"
-        f"📝 **Opis:** {opis}\n"
         f"📅 **Data:** {data}\n"
         f"🕒 **Godzina:** {godzina} (Europe/Warsaw)\n"
         f"🔊 **Kanał VC:** <#{NAGRYWKI_VC_ID}>\n\n"
@@ -1334,7 +1362,7 @@ def build_recording_embed(nagrywka):
 
     participants = len(nagrywka.get("uczestnicy", []))
     embed = discord.Embed(
-        title="🎬 NADCHODZĄCA NAGRYWKA",
+        title=f"🎬 {recording_display_name(nagrywka).upper()}",
         description=(
             "### 📢 Nowy termin został zaplanowany!\n"
             "Sprawdź szczegóły i kliknij reakcję ✅, aby potwierdzić swój udział."
@@ -1355,7 +1383,11 @@ def build_recording_embed(nagrywka):
     )
     if bot.user:
         embed.set_thumbnail(url=bot.user.display_avatar.url)
-    embed.set_footer(text="NegativE* • Reakcja ✅ oznacza potwierdzenie udziału")
+    message_id = nagrywka.get("message_id")
+    footer = "NegativE* • Reakcja ✅ oznacza potwierdzenie udziału"
+    if message_id:
+        footer += f" • ID: {message_id}"
+    embed.set_footer(text=footer)
     return embed
 
 def finalize_voice_sessions(nagrywka, end_time):
@@ -1418,7 +1450,14 @@ async def refresh_active_recording_messages():
         return
 
     channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    recordings_changed = False
     for message_id, nagrywka in nagrywki.items():
+        nagrywka["message_id"] = int(message_id)
+        if nagrywka.get("recording_number") is None:
+            nagrywka["recording_number"] = await asyncio.to_thread(next_recording_number)
+            nagrywka["opis"] = recording_display_name(nagrywka)
+            recordings_changed = True
+
         if channel is not None:
             try:
                 message = await channel.fetch_message(int(message_id))
@@ -1442,6 +1481,9 @@ async def refresh_active_recording_messages():
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
                 print(f"❌ Nie udało się odświeżyć postu nieobecności {thread_id}: {error}")
 
+    if recordings_changed:
+        await asyncio.to_thread(save_recordings, nagrywki)
+
 async def collect_absence_authors(thread_ids):
     authors_by_forum = {forum_id: set() for forum_id in NIEOBECNOSCI_FORUM_IDS}
 
@@ -1464,6 +1506,32 @@ async def collect_absence_authors(thread_ids):
             print(f"❌ Nie udało się odczytać nieobecności z postu {thread_id}: {error}")
 
     return authors_by_forum
+
+async def get_missing_recording_members(nagrywka, guild):
+    thread_ids = await find_recording_forum_threads(nagrywka)
+    absence_authors = await collect_absence_authors(thread_ids)
+    confirmed_ids = set(nagrywka.get("uczestnicy", []))
+    missing_by_role = {}
+
+    for role_id, forum_id in (
+        (NAGRYWKOWICZE_ROLE_ID, NIEOBECNOSCI_FORUM_IDS[0]),
+        (TESTOWI_ROLE_ID, NIEOBECNOSCI_FORUM_IDS[1])
+    ):
+        role = guild.get_role(role_id) if guild else None
+        missing = []
+        if role is not None:
+            absent_ids = absence_authors.get(forum_id, set())
+            for member in role.members:
+                if member.bot:
+                    continue
+                if member.id in confirmed_ids or member.id in absent_ids:
+                    continue
+                if any(member_role.id == URLOP_ROLE_ID for member_role in member.roles):
+                    continue
+                missing.append(member)
+        missing_by_role[role_id] = missing
+
+    return missing_by_role
 
 async def build_recording_statistics(message_id, nagrywka, guild):
     thread_ids = await find_recording_forum_threads(nagrywka)
@@ -1526,7 +1594,8 @@ async def build_recording_statistics(message_id, nagrywka, guild):
 
     return {
         "message_id": int(message_id),
-        "opis": nagrywka["opis"],
+        "opis": recording_display_name(nagrywka),
+        "recording_number": nagrywka.get("recording_number"),
         "data": nagrywka["data"],
         "godzina": nagrywka["godzina"],
         "timestamp": nagrywka["timestamp"],
@@ -1903,14 +1972,12 @@ async def check_vacations():
     description="Tworzy termin nagrywki"
 )
 @app_commands.describe(
-    opis="Opis nagrywki",
     data="Data (DD.MM.RRRR)",
     godzina="Godzina (HH:MM)",
     czas="Planowany czas nagrywki w minutach"
 )
 async def nagrywka(
     interaction: discord.Interaction,
-    opis: str,
     data: str,
     godzina: str,
     czas: int = 120
@@ -1957,17 +2024,25 @@ async def nagrywka(
         NAGRYWKI_CHANNEL_ID
     )
 
-    embed = build_recording_embed({
+    recording_number = await asyncio.to_thread(next_recording_number)
+    opis = f"Nagrywka #{recording_number}"
+
+    new_recording = {
         "opis": opis,
+        "recording_number": recording_number,
         "data": data,
         "godzina": godzina,
         "timestamp": termin.isoformat(),
         "uczestnicy": []
-    })
+    }
+    embed = build_recording_embed(new_recording)
 
     message = await channel.send(
         embed=embed
     )
+
+    new_recording["message_id"] = message.id
+    await message.edit(embed=build_recording_embed(new_recording))
 
     await message.add_reaction("✅")
 
@@ -1996,6 +2071,8 @@ async def nagrywka(
 
     nagrywki[str(message.id)] = {
         "opis": opis,
+        "recording_number": recording_number,
+        "message_id": message.id,
         "data": data,
         "godzina": godzina,
         "timestamp": termin.isoformat(),
@@ -2005,6 +2082,7 @@ async def nagrywka(
         "forum_thread_ids": forum_thread_ids,
         "forums_closed": False,
         "report_sent": False,
+        "missing_response_reminder_sent": False,
         "duration_minutes": czas,
         "voice_seconds": {},
         "voice_joined_at": {},
@@ -2081,74 +2159,96 @@ async def check_recordings():
                 nagrywka["forums_closed"] = True
                 changed = True
 
-        # PRZYPOMNIENIE 1H PRZED
+        # PRYWATNE PRZYPOMNIENIE O BRAKU ODPOWIEDZI 8H PRZED
+        if (
+            not nagrywka.get("missing_response_reminder_sent", False)
+            and 0 <= roznica <= 28800
+            and bot.get_guild(GUILD_ID) is not None
+        ):
+            guild = bot.get_guild(GUILD_ID)
+            missing_by_role = await get_missing_recording_members(nagrywka, guild)
+
+            for missing_members in missing_by_role.values():
+                for member in missing_members:
+                    try:
+                        reminder_embed = discord.Embed(
+                            title="⚠️ Brak odpowiedzi na termin nagrywki",
+                            description=(
+                                "Nie potwierdziłeś jeszcze udziału ani nie zgłosiłeś nieobecności. "
+                                "Daj znać, czy będziesz dostępny."
+                            ),
+                            color=discord.Color.orange(),
+                            timestamp=now
+                        )
+                        reminder_embed.add_field(
+                            name="🎬 Termin",
+                            value=(
+                                f"**{recording_display_name(nagrywka)}**\n"
+                                f"📅 {nagrywka['data']} • 🕒 {nagrywka['godzina']}"
+                            ),
+                            inline=False
+                        )
+                        reminder_embed.add_field(
+                            name="✅ Co zrobić?",
+                            value=(
+                                "Dodaj reakcję ✅ pod terminem, jeśli będziesz. "
+                                "Jeżeli nie możesz przyjść, napisz w odpowiednim poście nieobecności."
+                            ),
+                            inline=False
+                        )
+                        reminder_embed.set_footer(text="Automatyczne przypomnienie • 8 godzin przed nagrywką")
+                        await member.send(embed=reminder_embed)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+
+            nagrywka["missing_response_reminder_sent"] = True
+            changed = True
+
+        # RAPORT BRAKU ODPOWIEDZI 1H PRZED
+        if (
+            not nagrywka.get("report_sent", False)
+            and 0 <= roznica <= 3600
+            and bot.get_guild(GUILD_ID) is not None
+        ):
+            guild = bot.get_guild(GUILD_ID)
+            missing_by_role = await get_missing_recording_members(nagrywka, guild)
+            report_channel = bot.get_channel(REPORT_CHANNEL_ID)
+
+            if report_channel is not None:
+                report_embed = discord.Embed(
+                    title="⚠️ Brak potwierdzenia obecności",
+                    description=(
+                        f"🎬 **{recording_display_name(nagrywka)}**\n"
+                        f"📅 {nagrywka['data']} o {nagrywka['godzina']} (Europe/Warsaw)\n\n"
+                        "Poniższe osoby nie dały reakcji ✅, nie zgłosiły nieobecności "
+                        "i nie mają aktywnego urlopu."
+                    ),
+                    color=discord.Color.orange(),
+                    timestamp=now
+                )
+                for role_id, label in (
+                    (NAGRYWKOWICZE_ROLE_ID, "🎬 Pomocnicy"),
+                    (TESTOWI_ROLE_ID, "🧪 Testowi")
+                ):
+                    members = missing_by_role.get(role_id, [])
+                    value = "\n".join(member.mention for member in members) or "✅ Wszyscy odpowiedzieli"
+                    report_embed.add_field(name=label, value=value[:1024], inline=False)
+
+                report_embed.set_footer(text="Raport automatyczny • godzinę przed nagrywką")
+                await report_channel.send(
+                    embed=report_embed,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+                nagrywka["report_sent"] = True
+                changed = True
+
+        # PRZYPOMNIENIE DLA ZAPISANYCH 1H PRZED
         if (
             not nagrywka["reminder_sent"]
             and 0 <= roznica <= 3600
         ):
 
             guild = bot.get_guild(GUILD_ID)
-            forum_thread_ids = await find_recording_forum_threads(nagrywka)
-
-            if forum_thread_ids != nagrywka.get("forum_thread_ids", []):
-                nagrywka["forum_thread_ids"] = forum_thread_ids
-                if forum_thread_ids:
-                    nagrywka["forums_closed"] = False
-                changed = True
-
-            absence_authors = await collect_absence_authors(forum_thread_ids)
-            confirmed_ids = set(nagrywka["uczestnicy"])
-            missing_by_role = {}
-
-            role_forum_pairs = (
-                (NAGRYWKOWICZE_ROLE_ID, NIEOBECNOSCI_FORUM_IDS[0]),
-                (TESTOWI_ROLE_ID, NIEOBECNOSCI_FORUM_IDS[1])
-            )
-
-            if guild is not None:
-                for role_id, forum_id in role_forum_pairs:
-                    role = guild.get_role(role_id)
-                    missing = []
-
-                    if role is not None:
-                        absent_ids = absence_authors.get(forum_id, set())
-                        for member in role.members:
-                            if member.bot:
-                                continue
-                            if member.id in confirmed_ids or member.id in absent_ids:
-                                continue
-                            if any(member_role.id == URLOP_ROLE_ID for member_role in member.roles):
-                                continue
-                            missing.append(member)
-
-                    missing_by_role[role_id] = missing
-
-            if not nagrywka.get("report_sent", False):
-                report_channel = bot.get_channel(REPORT_CHANNEL_ID)
-                if report_channel is not None:
-                    embed = discord.Embed(
-                        title="⚠️ Brak potwierdzenia obecności",
-                        description=(
-                            f"🎬 **{nagrywka['opis']}**\n"
-                            f"📅 {nagrywka['data']} o {nagrywka['godzina']} "
-                            "(Europe/Warsaw)\n\n"
-                            "Poniższe osoby nie dały reakcji ✅, nie zgłosiły "
-                            "nieobecności i nie mają aktywnego urlopu."
-                        ),
-                        color=discord.Color.orange()
-                    )
-
-                    for role_id, label in (
-                        (NAGRYWKOWICZE_ROLE_ID, "🎬 Nagrywkowicze"),
-                        (TESTOWI_ROLE_ID, "🧪 Testowi")
-                    ):
-                        members = missing_by_role.get(role_id, [])
-                        value = "\n".join(member.mention for member in members) or "✅ Wszyscy odpowiedzieli"
-                        embed.add_field(name=label, value=value[:1024], inline=False)
-
-                    await report_channel.send(embed=embed)
-                    nagrywka["report_sent"] = True
-                    changed = True
 
             for user_id in nagrywka["uczestnicy"]:
 
@@ -2322,8 +2422,8 @@ async def check_recordings():
 def recording_select_options(nagrywki):
     return [
         discord.SelectOption(
-            label=nagrywka["opis"][:50],
-            description=f"{nagrywka['data']} {nagrywka['godzina']}"[:100],
+            label=recording_display_name(nagrywka)[:100],
+            description=f"{nagrywka['data']} • {nagrywka['godzina']} • ID: {message_id}"[:100],
             value=message_id
         )
         for message_id, nagrywka in nagrywki.items()
@@ -2359,7 +2459,6 @@ class RecordingActionView(View):
         self.add_item(RecordingActionSelect(action, user))
 
 class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
-    opis = TextInput(label="Opis", max_length=1000)
     data = TextInput(label="Data (DD.MM.RRRR)", max_length=10)
     godzina = TextInput(label="Godzina (HH:MM)", max_length=5)
     czas = TextInput(label="Czas w minutach", max_length=3)
@@ -2367,7 +2466,6 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
     def __init__(self, recording_id, nagrywka):
         super().__init__()
         self.recording_id = recording_id
-        self.opis.default = nagrywka["opis"]
         self.data.default = nagrywka["data"]
         self.godzina.default = nagrywka["godzina"]
         self.czas.default = str(nagrywka.get("duration_minutes", 120))
@@ -2391,13 +2489,13 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
             return
 
         nagrywka.update({
-            "opis": self.opis.value,
             "data": self.data.value,
             "godzina": self.godzina.value,
             "timestamp": termin.isoformat(),
             "duration_minutes": duration,
             "reminder_sent": False,
             "report_sent": False,
+            "missing_response_reminder_sent": False,
             "forums_closed": False
         })
         save_recordings(nagrywki)
@@ -2420,7 +2518,7 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
                 await thread.edit(name=recording_forum_title(self.data.value))
                 starter_message = await thread.fetch_message(thread.id)
                 await starter_message.edit(content=recording_forum_content(
-                    self.opis.value,
+                    recording_display_name(nagrywka),
                     self.data.value,
                     self.godzina.value,
                     duration
@@ -2436,7 +2534,7 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
 
 @bot.tree.command(
     name="edytujnagrywke",
-    description="Zmienia termin, opis i czas wybranej nagrywki"
+    description="Zmienia datę, godzinę i czas wybranej nagrywki"
 )
 async def edytujnagrywke(interaction: discord.Interaction):
     if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
@@ -2466,10 +2564,10 @@ class CancelRecordingSelect(Select):
 
             options.append(
                 discord.SelectOption(
-                    label=nagrywka["opis"][:50],
+                    label=recording_display_name(nagrywka)[:100],
                     description=(
                         f"{nagrywka['data']} "
-                        f"{nagrywka['godzina']}"
+                        f"{nagrywka['godzina']} • ID: {message_id}"
                     )[:100],
                     value=message_id
                 )
@@ -3217,7 +3315,7 @@ def day_member_poll_embed(poll, guild):
         name="⚖️ Zasady głosowania",
         value=(
             "• Każda osoba ma **jeden głos**.\n"
-            "• Głos można zmienić do zakończenia ankiety.\n"
+            "• Oddanego głosu **nie można zmienić**.\n"
             "• **Nie można głosować na samego siebie.**\n"
             "• Wyniki pozostają ukryte do końca głosowania."
         ),
@@ -3259,6 +3357,14 @@ class DayMemberVoteSelect(Select):
             await send_response(interaction, "❌ To głosowanie jest już zakończone.", ephemeral=True)
             return
 
+        if str(interaction.user.id) in poll.get("votes", {}):
+            await send_response(
+                interaction,
+                "❌ Twój głos został już oddany i nie można go zmienić.",
+                ephemeral=True
+            )
+            return
+
         candidate_id = int(self.values[0])
         if candidate_id not in poll.get("candidate_ids", []):
             await send_response(interaction, "❌ Nieprawidłowy kandydat.", ephemeral=True)
@@ -3272,16 +3378,27 @@ class DayMemberVoteSelect(Select):
             )
             return
 
-        await asyncio.to_thread(
+        vote_result = await asyncio.to_thread(
             day_member_polls_collection.update_one,
-            {"poll_id": self.poll_id, "closed": False},
+            {
+                "poll_id": self.poll_id,
+                "closed": False,
+                f"votes.{interaction.user.id}": {"$exists": False}
+            },
             {"$set": {f"votes.{interaction.user.id}": candidate_id}}
         )
+        if vote_result.modified_count == 0:
+            await send_response(
+                interaction,
+                "❌ Twój głos został już oddany albo ankieta została zakończona.",
+                ephemeral=True
+            )
+            return
         candidate = interaction.guild.get_member(candidate_id)
         candidate_name = candidate.display_name if candidate else f"ID {candidate_id}"
         await send_response(
             interaction,
-            f"✅ Twój głos na **{candidate_name}** został zapisany. Możesz go później zmienić.",
+            f"✅ Twój głos na **{candidate_name}** został zapisany.",
             ephemeral=True
         )
 
@@ -3308,60 +3425,47 @@ async def close_day_member_poll(poll_id, closed_by=None):
 
     votes = poll.get("votes", {})
     counts = {int(user_id): 0 for user_id in poll.get("candidate_ids", [])}
-    valid_vote_count = 0
     for voter_id, candidate_id in votes.items():
         candidate_id = int(candidate_id)
         if candidate_id in counts and int(voter_id) != candidate_id:
             counts[candidate_id] += 1
-            valid_vote_count += 1
 
     highest = max(counts.values(), default=0)
     winners = [user_id for user_id, count in counts.items() if count == highest and highest > 0]
-    ranking = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-    medals = ("🥇", "🥈", "🥉")
-    ranking_lines = []
-    for position, (user_id, count) in enumerate(ranking, start=1):
-        marker = medals[position - 1] if position <= 3 else f"`{position}.`"
-        if count == 1:
-            vote_word = "głos"
-        elif 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
-            vote_word = "głosy"
-        else:
-            vote_word = "głosów"
-        ranking_lines.append(f"{marker} <@{user_id}>  •  **{count} {vote_word}**")
-    ranking_text = "\n".join(ranking_lines) or "Brak kandydatów."
+    if highest == 1:
+        vote_word = "głos"
+    elif 2 <= highest % 10 <= 4 and not 12 <= highest % 100 <= 14:
+        vote_word = "głosy"
+    else:
+        vote_word = "głosów"
 
     if not winners:
-        result_text = "### 🗳️ Brak rozstrzygnięcia\nNie oddano żadnego ważnego głosu."
+        result_text = "# 🗳️ Brak zwycięzcy\n## Nie oddano żadnego ważnego głosu"
     elif len(winners) == 1:
-        result_text = f"### 🎉 Zwycięzcą zostaje <@{winners[0]}>!\nGratulacje — zdobywasz tytuł **Nagrywkowicza Dnia**!"
+        result_text = (
+            f"# 🥇 <@{winners[0]}>\n"
+            f"## {highest} {vote_word}"
+        )
     else:
-        result_text = "### 🤝 Mamy remis!\nTytuł zdobywają: " + ", ".join(f"<@{user_id}>" for user_id in winners)
+        result_text = (
+            "# 🤝 Remis zwycięzców\n"
+            + ", ".join(f"<@{user_id}>" for user_id in winners)
+            + f"\n## {highest} {vote_word}"
+        )
 
     result_embed = discord.Embed(
-        title="🏆 NAGRYWKOWICZ DNIA — WYNIKI",
+        title=f"🏆 NAGRYWKOWICZ DNIA — {poll['recording_data']}",
         description=result_text,
         color=discord.Color.gold(),
         timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
     )
-    result_embed.add_field(
-        name="🎬 Nagrywka",
-        value=f"**{poll['recording_opis']}**\n{poll['recording_data']} • {poll['recording_godzina']}",
-        inline=False
-    )
-    result_embed.add_field(name="📊 Końcowa klasyfikacja", value=ranking_text[:1024], inline=False)
-    result_embed.add_field(name="🗳️ Ważne głosy", value=f"**{valid_vote_count}**", inline=True)
-    if closed_by:
-        result_embed.add_field(name="🔒 Zakończył", value=closed_by.mention, inline=True)
-    else:
-        result_embed.add_field(name="🕛 Zakończenie", value="Automatycznie o północy", inline=True)
     if len(winners) == 1:
         winner = bot.get_user(winners[0])
         if winner:
             result_embed.set_thumbnail(url=winner.display_avatar.url)
     elif bot.user:
         result_embed.set_thumbnail(url=bot.user.display_avatar.url)
-    result_embed.set_footer(text="NegativE* • Dziękujemy za udział w głosowaniu")
+    result_embed.set_footer(text="NegativE* • Nagrywkowicz Dnia")
 
     channel = bot.get_channel(int(poll["channel_id"]))
     if channel is None:
@@ -3373,17 +3477,9 @@ async def close_day_member_poll(poll_id, closed_by=None):
     if channel is not None:
         try:
             message = await channel.fetch_message(int(poll["message_id"]))
-            closed_embed = message.embeds[0] if message.embeds else discord.Embed()
-            closed_embed.title = "🔒 Nagrywkowicz Dnia — głosowanie zakończone"
-            closed_embed.color = discord.Color.dark_grey()
-            await message.edit(embed=closed_embed, view=None)
+            await message.edit(embed=result_embed, view=None)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
-
-        await channel.send(
-            embed=result_embed,
-            allowed_mentions=discord.AllowedMentions.none()
-        )
 
     await asyncio.to_thread(
         day_member_polls_collection.update_one,
@@ -3422,8 +3518,11 @@ class DayMemberRecordingSelect(Select):
             max_values=1,
             options=[
                 discord.SelectOption(
-                    label=doc.get("opis", "Nagrywka")[:100],
-                    description=f"{doc.get('data', '')} {doc.get('godzina', '')}"[:100],
+                    label=recording_display_name(doc)[:100],
+                    description=(
+                        f"{doc.get('data', '')} • {doc.get('godzina', '')} "
+                        f"• ID: {doc['message_id']}"
+                    )[:100],
                     value=str(doc["message_id"])
                 )
                 for doc in documents[:25]
@@ -3478,7 +3577,7 @@ class DayMemberRecordingSelect(Select):
             "channel_id": interaction.channel.id,
             "message_id": None,
             "recording_message_id": int(document["message_id"]),
-            "recording_opis": document.get("opis", "Nagrywka"),
+            "recording_opis": recording_display_name(document),
             "recording_data": document.get("data", "brak daty"),
             "recording_godzina": document.get("godzina", "brak godziny"),
             "candidate_ids": candidates,
