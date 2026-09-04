@@ -1081,11 +1081,8 @@ async def on_voice_state_update(member, before, after):
 
             if after.channel and after.channel.id == NAGRYWKI_VC_ID:
                 tracking_window_started = now >= termin - timedelta(hours=3)
-                recording_not_finished = now <= termin + timedelta(
-                    minutes=nagrywka.get("duration_minutes", 120)
-                )
                 is_first_entry = user_key not in first_joined_at
-                if tracking_window_started and recording_not_finished and is_first_entry:
+                if tracking_window_started and is_first_entry:
                     first_joined_at[user_key] = now.isoformat()
                     tracking_changed = True
 
@@ -1143,30 +1140,25 @@ async def on_voice_state_update(member, before, after):
                     )
                     tracking_changed = True
 
-                planned_end = termin + timedelta(minutes=nagrywka.get("duration_minutes", 120))
                 if (
-                    now < planned_end
-                    and not member.bot
+                    not member.bot
                     and any(
                         role.id in {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
                         for role in member.roles
                     )
                 ):
-                    remaining_seconds = int((planned_end - now).total_seconds())
-                    remaining_minutes = (remaining_seconds + 59) // 60
-                    nagrywka.setdefault("early_exit_events", []).append({
+                    nagrywka.setdefault("voice_exit_events", []).append({
                         "user_id": member.id,
-                        "left_at": now.isoformat(),
-                        "minutes_before_end": remaining_minutes
+                        "left_at": now.isoformat()
                     })
                     tracking_changed = True
 
                     exit_log_channel = bot.get_channel(LATE_EXIT_LOG_CHANNEL_ID)
                     if exit_log_channel:
                         exit_embed = discord.Embed(
-                            title="🚪 Wcześniejsze wyjście z nagrywki",
-                            description=f"{member.mention} opuścił kanał przed planowanym końcem.",
-                            color=discord.Color.red(),
+                            title="🚪 Wyjście z trwającej nagrywki",
+                            description=f"{member.mention} opuścił kanał nagrywkowy.",
+                            color=discord.Color.orange(),
                             timestamp=now
                         )
                         exit_embed.set_thumbnail(url=member.display_avatar.url)
@@ -1174,11 +1166,6 @@ async def on_voice_state_update(member, before, after):
                             name="🎬 Nagrywka",
                             value=f"**{nagrywka['opis']}**\n{nagrywka['data']} • {nagrywka['godzina']}",
                             inline=False
-                        )
-                        exit_embed.add_field(
-                            name="⏳ Do końca pozostało",
-                            value=f"**{remaining_minutes} min**",
-                            inline=True
                         )
                         exit_embed.add_field(
                             name="🕒 Godzina wyjścia",
@@ -1342,7 +1329,7 @@ def next_recording_number():
     )
     return int(counter["value"])
 
-def recording_forum_content(opis, data, godzina, duration=None):
+def recording_forum_content(opis, data, godzina):
     return (
         "🎬 **Termin nagrywki**\n\n"
         f"📅 **Data:** {data}\n"
@@ -1608,9 +1595,59 @@ async def build_recording_statistics(message_id, nagrywka, guild):
         "first_voice_join_at": first_entries,
         "late_minutes": late_minutes,
         "early_minutes": early_minutes,
-        "early_exit_events": nagrywka.get("early_exit_events", []),
+        "voice_exit_events": nagrywka.get("voice_exit_events", []),
         "forum_thread_ids": thread_ids
     }
+
+async def send_recording_completion_report(message_id, nagrywka, statistics, end_time):
+    report_channel = bot.get_channel(REPORT_CHANNEL_ID)
+    if report_channel is None:
+        print(f"❌ Nie znaleziono kanału raportów: {REPORT_CHANNEL_ID}")
+        return
+
+    try:
+        start_time = datetime.fromisoformat(nagrywka["timestamp"])
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+        elapsed_minutes = max(0, int((end_time - start_time).total_seconds() // 60))
+    except (KeyError, TypeError, ValueError):
+        elapsed_minutes = 0
+
+    hours, minutes = divmod(elapsed_minutes, 60)
+    if hours and minutes:
+        elapsed_text = f"{hours} godz. {minutes} min"
+    elif hours:
+        elapsed_text = f"{hours} godz."
+    elif minutes:
+        elapsed_text = f"{minutes} min"
+    else:
+        elapsed_text = "mniej niż minutę"
+
+    present_ids = statistics.get("confirmed_ids", [])
+    present_text = "\n".join(f"<@{user_id}>" for user_id in present_ids)
+    if not present_text:
+        present_text = "Brak osób z zaliczonym minimum 35 minut."
+
+    embed = discord.Embed(
+        title=f"📋 RAPORT — {recording_display_name(nagrywka).upper()}",
+        description="Nagrywka została zakończona, a obecność zapisana w statystykach.",
+        color=discord.Color.green(),
+        timestamp=end_time
+    )
+    embed.add_field(name="📅 Data", value=f"**{nagrywka['data']}**", inline=True)
+    embed.add_field(name="🕒 Godzina rozpoczęcia", value=f"**{nagrywka['godzina']}**", inline=True)
+    embed.add_field(name="⏱️ Rzeczywisty czas", value=f"**{elapsed_text}**", inline=True)
+    embed.add_field(
+        name=f"✅ Obecni ({len(present_ids)})",
+        value=present_text[:1024],
+        inline=False
+    )
+    embed.set_footer(text=f"ID terminu: {message_id} • Minimum obecności: 35 minut")
+
+    await report_channel.send(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
 
 def load_vacations():
 
@@ -1973,14 +2010,12 @@ async def check_vacations():
 )
 @app_commands.describe(
     data="Data (DD.MM.RRRR)",
-    godzina="Godzina (HH:MM)",
-    czas="Planowany czas nagrywki w minutach"
+    godzina="Godzina (HH:MM)"
 )
 async def nagrywka(
     interaction: discord.Interaction,
     data: str,
-    godzina: str,
-    czas: int = 120
+    godzina: str
 ):
 
     await interaction.response.defer(
@@ -2013,13 +2048,6 @@ async def nagrywka(
 
         return
 
-    if czas < 35 or czas > 720:
-        await interaction.followup.send(
-            "❌ Czas nagrywki musi wynosić od 35 do 720 minut.",
-            ephemeral=True
-        )
-        return
-
     channel = bot.get_channel(
         NAGRYWKI_CHANNEL_ID
     )
@@ -2047,7 +2075,7 @@ async def nagrywka(
     await message.add_reaction("✅")
 
     post_title = recording_forum_title(data)
-    post_content = recording_forum_content(opis, data, godzina, czas)
+    post_content = recording_forum_content(opis, data, godzina)
 
     forum_thread_ids = []
 
@@ -2083,11 +2111,10 @@ async def nagrywka(
         "forums_closed": False,
         "report_sent": False,
         "missing_response_reminder_sent": False,
-        "duration_minutes": czas,
         "voice_seconds": {},
         "voice_joined_at": {},
         "first_voice_join_at": {},
-        "early_exit_events": []
+        "voice_exit_events": []
     }
 
     save_recordings(nagrywki)
@@ -2362,9 +2389,6 @@ async def check_recordings():
 
             changed = True
 
-        duration_minutes = nagrywka.get("duration_minutes", 120)
-        automatic_end = termin + timedelta(minutes=duration_minutes)
-
         if nagrywka.get("started", False):
             voice_channel = bot.get_channel(NAGRYWKI_VC_ID)
             joined_at = nagrywka.setdefault("voice_joined_at", {})
@@ -2378,42 +2402,6 @@ async def check_recordings():
                     if str(voice_member.id) not in first_joined_at:
                         first_joined_at[str(voice_member.id)] = now.isoformat()
                         changed = True
-
-        if nagrywka.get("started", False) and now >= automatic_end:
-            finalize_voice_sessions(nagrywka, now)
-            guild = bot.get_guild(GUILD_ID)
-
-            if guild is not None:
-                statistics = await build_recording_statistics(message_id, nagrywka, guild)
-                statistics["ended_automatically"] = True
-                await asyncio.to_thread(
-                    recording_stats_collection.update_one,
-                    {"message_id": int(message_id)},
-                    {"$set": statistics},
-                    True
-                )
-
-            recording_channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
-            if recording_channel is not None:
-                try:
-                    message = await recording_channel.fetch_message(int(message_id))
-                    finished_embed = discord.Embed(
-                        title="✅ NAGRYWKA ZAKOŃCZONA AUTOMATYCZNIE",
-                        description=nagrywka["opis"],
-                        color=discord.Color.green()
-                    )
-                    finished_embed.add_field(
-                        name="⏱️ Minimalna obecność",
-                        value="35 minut na kanale VC",
-                        inline=False
-                    )
-                    await message.edit(embed=finished_embed, view=None)
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
-                    print(f"❌ Nie udało się oznaczyć zakończonej nagrywki {message_id}: {error}")
-
-            del nagrywki[message_id]
-            changed = True
-
 
     if changed:
 
@@ -2461,25 +2449,20 @@ class RecordingActionView(View):
 class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
     data = TextInput(label="Data (DD.MM.RRRR)", max_length=10)
     godzina = TextInput(label="Godzina (HH:MM)", max_length=5)
-    czas = TextInput(label="Czas w minutach", max_length=3)
 
     def __init__(self, recording_id, nagrywka):
         super().__init__()
         self.recording_id = recording_id
         self.data.default = nagrywka["data"]
         self.godzina.default = nagrywka["godzina"]
-        self.czas.default = str(nagrywka.get("duration_minutes", 120))
 
     async def on_submit(self, interaction):
         try:
             termin = datetime.strptime(
                 f"{self.data.value} {self.godzina.value}", "%d.%m.%Y %H:%M"
             ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
-            duration = int(self.czas.value)
-            if not 35 <= duration <= 720:
-                raise ValueError
         except ValueError:
-            await send_response(interaction, "❌ Niepoprawna data, godzina lub czas.", ephemeral=True)
+            await send_response(interaction, "❌ Niepoprawna data lub godzina.", ephemeral=True)
             return
 
         nagrywki = load_recordings()
@@ -2492,7 +2475,6 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
             "data": self.data.value,
             "godzina": self.godzina.value,
             "timestamp": termin.isoformat(),
-            "duration_minutes": duration,
             "reminder_sent": False,
             "report_sent": False,
             "missing_response_reminder_sent": False,
@@ -2520,8 +2502,7 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
                 await starter_message.edit(content=recording_forum_content(
                     recording_display_name(nagrywka),
                     self.data.value,
-                    self.godzina.value,
-                    duration
+                    self.godzina.value
                 ))
 
                 close_time = termin - timedelta(hours=3)
@@ -2534,7 +2515,7 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
 
 @bot.tree.command(
     name="edytujnagrywke",
-    description="Zmienia datę, godzinę i czas wybranej nagrywki"
+    description="Zmienia datę i godzinę wybranej nagrywki"
 )
 async def edytujnagrywke(interaction: discord.Interaction):
     if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
@@ -2602,22 +2583,36 @@ class CancelRecordingSelect(Select):
             )
 
             embed = discord.Embed(
-                title="❌ NAGRYWKA ODWOŁANA",
+                title=f"❌ {recording_display_name(nagrywka).upper()} — ODWOŁANA",
                 description=(
-                    "Ta nagrywka została "
-                    "odwołana przez administrację."
+                    "### Termin został anulowany\n"
+                    "Ta nagrywka nie odbędzie się. Posty nieobecności zostały automatycznie zamknięte."
                 ),
-                color=discord.Color.red()
+                color=discord.Color.red(),
+                timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
             )
 
             embed.add_field(
-                name="🎬 Nagrywka",
-                value=nagrywka["opis"],
+                name="📅 Data",
+                value=f"**{nagrywka['data']}**",
+                inline=True
+            )
+            embed.add_field(
+                name="🕒 Godzina",
+                value=f"**{nagrywka['godzina']}**",
+                inline=True
+            )
+            embed.add_field(
+                name="👤 Odwołano przez",
+                value=interaction.user.mention,
                 inline=False
             )
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            embed.set_footer(text=f"NegativE* • ID terminu: {message_id}")
 
             await message.edit(
-                embed=embed
+                embed=embed,
+                view=None
             )
 
         except:
@@ -3007,9 +3002,10 @@ async def zakoncznagrywke(
 
     guild = bot.get_guild(GUILD_ID)
     if guild is not None:
+        end_time = datetime.now(ZoneInfo("Europe/Warsaw"))
         finalize_voice_sessions(
             nagrywka,
-            datetime.now(ZoneInfo("Europe/Warsaw"))
+            end_time
         )
         statistics = await build_recording_statistics(message_id, nagrywka, guild)
         await asyncio.to_thread(
@@ -3017,6 +3013,12 @@ async def zakoncznagrywke(
             {"message_id": int(message_id)},
             {"$set": statistics},
             True
+        )
+        await send_recording_completion_report(
+            message_id,
+            nagrywka,
+            statistics,
+            end_time
         )
 
     del nagrywki[message_id]
