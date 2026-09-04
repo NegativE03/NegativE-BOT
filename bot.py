@@ -128,6 +128,7 @@ async def on_ready():
         check_day_member_polls.start()
 
     await ensure_personal_stats_panel()
+    await refresh_active_recording_messages()
 
 # /ping
 @bot.tree.command(name="ping", description="Sprawdza opóźnienie bota")
@@ -838,9 +839,12 @@ async def on_raw_reaction_add(payload):
                 embed = message.embeds[0]
 
                 embed.set_field_at(
-                    4,
-                    name="✅ Biorę udział",
-                    value=f"{len(nagrywka['uczestnicy'])} osób",
+                    3,
+                    name="✅ Potwierdzone osoby",
+                    value=(
+                        f"**{len(nagrywka['uczestnicy'])}** "
+                        f"{polish_people_word(len(nagrywka['uczestnicy']))}"
+                    ),
                     inline=False
                 )
 
@@ -959,9 +963,12 @@ async def on_raw_reaction_remove(payload):
                 embed = message.embeds[0]
 
                 embed.set_field_at(
-                    4,
-                    name="✅ Biorę udział",
-                    value=f"{len(nagrywka['uczestnicy'])} osób",
+                    3,
+                    name="✅ Potwierdzone osoby",
+                    value=(
+                        f"**{len(nagrywka['uczestnicy'])}** "
+                        f"{polish_people_word(len(nagrywka['uczestnicy']))}"
+                    ),
                     inline=False
                 )
 
@@ -1074,7 +1081,7 @@ async def on_voice_state_update(member, before, after):
             if after.channel and after.channel.id == NAGRYWKI_VC_ID:
                 tracking_window_started = now >= termin - timedelta(hours=3)
                 recording_not_finished = now <= termin + timedelta(
-                    minutes=nagrywka.get("duration_minutes", 90)
+                    minutes=nagrywka.get("duration_minutes", 120)
                 )
                 is_first_entry = user_key not in first_joined_at
                 if tracking_window_started and recording_not_finished and is_first_entry:
@@ -1135,7 +1142,7 @@ async def on_voice_state_update(member, before, after):
                     )
                     tracking_changed = True
 
-                planned_end = termin + timedelta(minutes=nagrywka.get("duration_minutes", 90))
+                planned_end = termin + timedelta(minutes=nagrywka.get("duration_minutes", 120))
                 if (
                     now < planned_end
                     and not member.bot
@@ -1299,16 +1306,57 @@ def recording_forum_title(date_text):
     weekday = POLISH_WEEKDAYS[recording_date.weekday()]
     return f"Nieobecność {date_text} — {weekday}"
 
-def recording_forum_content(opis, data, godzina, duration):
+def polish_people_word(count):
+    if count == 1:
+        return "osoba"
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return "osoby"
+    return "osób"
+
+def recording_forum_content(opis, data, godzina, duration=None):
     return (
         "🎬 **Termin nagrywki**\n\n"
         f"📝 **Opis:** {opis}\n"
         f"📅 **Data:** {data}\n"
         f"🕒 **Godzina:** {godzina} (Europe/Warsaw)\n"
-        f"⏱️ **Planowany czas:** {duration} minut\n"
         f"🔊 **Kanał VC:** <#{NAGRYWKI_VC_ID}>\n\n"
         "Jeżeli nie możesz pojawić się na nagrywce, zgłoś swoją nieobecność w tym poście."
     )
+
+def build_recording_embed(nagrywka):
+    try:
+        termin = datetime.fromisoformat(nagrywka["timestamp"])
+        if termin.tzinfo is None:
+            termin = termin.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+        relative_time = f"<t:{int(termin.timestamp())}:R>"
+    except (KeyError, TypeError, ValueError):
+        relative_time = "Termin zostanie podany wkrótce"
+
+    participants = len(nagrywka.get("uczestnicy", []))
+    embed = discord.Embed(
+        title="🎬 NADCHODZĄCA NAGRYWKA",
+        description=(
+            "### 📢 Nowy termin został zaplanowany!\n"
+            "Sprawdź szczegóły i kliknij reakcję ✅, aby potwierdzić swój udział."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="📅 Data", value=f"**{nagrywka['data']}**", inline=True)
+    embed.add_field(name="🕒 Godzina", value=f"**{nagrywka['godzina']}**", inline=True)
+    embed.add_field(
+        name="🔊 Miejsce spotkania",
+        value=f"<#{NAGRYWKI_VC_ID}>\nStart {relative_time}",
+        inline=False
+    )
+    embed.add_field(
+        name="✅ Potwierdzone osoby",
+        value=f"**{participants}** {polish_people_word(participants)}",
+        inline=False
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="NegativE* • Reakcja ✅ oznacza potwierdzenie udziału")
+    return embed
 
 def finalize_voice_sessions(nagrywka, end_time):
     joined_at = nagrywka.setdefault("voice_joined_at", {})
@@ -1363,6 +1411,36 @@ async def find_recording_forum_threads(nagrywka):
             found_ids.append(matching_thread.id)
 
     return found_ids
+
+async def refresh_active_recording_messages():
+    nagrywki = await asyncio.to_thread(load_recordings)
+    if not nagrywki:
+        return
+
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    for message_id, nagrywka in nagrywki.items():
+        if channel is not None:
+            try:
+                message = await channel.fetch_message(int(message_id))
+                await message.edit(embed=build_recording_embed(nagrywka))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się odświeżyć terminu nagrywki {message_id}: {error}")
+
+        for thread_id in await find_recording_forum_threads(nagrywka):
+            try:
+                thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+                was_archived = thread.archived
+                was_locked = thread.locked
+                if was_archived or was_locked:
+                    await thread.edit(archived=False, locked=False)
+                starter_message = await thread.fetch_message(thread.id)
+                await starter_message.edit(content=recording_forum_content(
+                    nagrywka["opis"], nagrywka["data"], nagrywka["godzina"]
+                ))
+                if was_archived or was_locked:
+                    await thread.edit(archived=was_archived, locked=was_locked)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się odświeżyć postu nieobecności {thread_id}: {error}")
 
 async def collect_absence_authors(thread_ids):
     authors_by_forum = {forum_id: set() for forum_id in NIEOBECNOSCI_FORUM_IDS}
@@ -1835,7 +1913,7 @@ async def nagrywka(
     opis: str,
     data: str,
     godzina: str,
-    czas: int = 90
+    czas: int = 120
 ):
 
     await interaction.response.defer(
@@ -1879,44 +1957,13 @@ async def nagrywka(
         NAGRYWKI_CHANNEL_ID
     )
 
-    embed = discord.Embed(
-        title="🎬 TERMIN NAGRYWKI",
-        color=discord.Color.blue()
-    )
-
-    embed.add_field(
-        name="📝 Opis",
-        value=opis,
-        inline=False
-    )
-
-    embed.add_field(
-        name="📅 Data",
-        value=data,
-        inline=True
-    )
-
-    embed.add_field(
-        name="🕒 Godzina",
-        value=f"{godzina}\n⏱️ {czas} min",
-        inline=True
-    )
-
-    embed.add_field(
-        name="🔊 Kanał VC",
-        value=f"<#{NAGRYWKI_VC_ID}>",
-        inline=False
-    )
-
-    embed.add_field(
-        name="✅ Biorę udział",
-        value="0 osób",
-        inline=False
-    )
-
-    embed.set_footer(
-        text="Kliknij ✅ aby zapisać się na nagrywkę."
-    )
+    embed = build_recording_embed({
+        "opis": opis,
+        "data": data,
+        "godzina": godzina,
+        "timestamp": termin.isoformat(),
+        "uczestnicy": []
+    })
 
     message = await channel.send(
         embed=embed
@@ -2215,7 +2262,7 @@ async def check_recordings():
 
             changed = True
 
-        duration_minutes = nagrywka.get("duration_minutes", 90)
+        duration_minutes = nagrywka.get("duration_minutes", 120)
         automatic_end = termin + timedelta(minutes=duration_minutes)
 
         if nagrywka.get("started", False):
@@ -2323,7 +2370,7 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
         self.opis.default = nagrywka["opis"]
         self.data.default = nagrywka["data"]
         self.godzina.default = nagrywka["godzina"]
-        self.czas.default = str(nagrywka.get("duration_minutes", 90))
+        self.czas.default = str(nagrywka.get("duration_minutes", 120))
 
     async def on_submit(self, interaction):
         try:
@@ -2358,11 +2405,7 @@ class EditRecordingModal(Modal, title="Edytuj nagrywkę"):
         channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
         try:
             message = await channel.fetch_message(int(self.recording_id))
-            embed = message.embeds[0]
-            embed.set_field_at(0, name="📝 Opis", value=self.opis.value, inline=False)
-            embed.set_field_at(1, name="📅 Data", value=self.data.value, inline=True)
-            embed.set_field_at(2, name="🕒 Godzina", value=f"{self.godzina.value}\n⏱️ {duration} min", inline=True)
-            await message.edit(embed=embed)
+            await message.edit(embed=build_recording_embed(nagrywka))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
@@ -2508,6 +2551,18 @@ class CancelRecordingSelect(Select):
 
             except:
                 pass
+
+        # Zamknij i zablokuj oba posty nieobecności po odwołaniu nagrywki.
+        for thread_id in await find_recording_forum_threads(nagrywka):
+            try:
+                thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+                await thread.edit(
+                    archived=True,
+                    locked=True,
+                    reason=f"Nagrywka odwołana przez {interaction.user}"
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się zamknąć postu nieobecności {thread_id}: {error}")
 
 
         # Logi
@@ -2746,9 +2801,12 @@ async def usunobecnosc(
             if message.embeds:
                 embed = message.embeds[0]
                 embed.set_field_at(
-                    4,
-                    name="✅ Biorę udział",
-                    value=f"{len(nagrywka['uczestnicy'])} osób",
+                    3,
+                    name="✅ Potwierdzone osoby",
+                    value=(
+                        f"**{len(nagrywka['uczestnicy'])}** "
+                        f"{polish_people_word(len(nagrywka['uczestnicy']))}"
+                    ),
                     inline=False
                 )
                 await message.edit(embed=embed)
