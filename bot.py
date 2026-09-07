@@ -1448,6 +1448,27 @@ async def refresh_active_recording_messages():
         if channel is not None:
             try:
                 message = await channel.fetch_message(int(message_id))
+
+                # Reakcje na wiadomości są źródłem prawdy. Dzięki temu po restarcie
+                # odzyskamy również potwierdzenia kliknięte zanim zapis nagrywki
+                # zdążył trafić do bazy.
+                confirmed_ids = []
+                for reaction in message.reactions:
+                    if str(reaction.emoji) != "✅":
+                        continue
+                    async for user in reaction.users():
+                        if user.bot:
+                            continue
+                        member = message.guild.get_member(user.id)
+                        if member and any(role.id == URLOP_ROLE_ID for role in member.roles):
+                            continue
+                        confirmed_ids.append(user.id)
+
+                confirmed_ids = list(dict.fromkeys(confirmed_ids))
+                if set(confirmed_ids) != set(nagrywka.get("uczestnicy", [])):
+                    nagrywka["uczestnicy"] = confirmed_ids
+                    recordings_changed = True
+
                 await message.edit(embed=build_recording_embed(nagrywka))
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
                 print(f"❌ Nie udało się odświeżyć terminu nagrywki {message_id}: {error}")
@@ -2032,6 +2053,21 @@ async def nagrywka(
         )
         return
 
+    active_recordings = await asyncio.to_thread(load_recordings)
+    if active_recordings:
+        existing_id, existing_recording = next(iter(active_recordings.items()))
+        await interaction.followup.send(
+            (
+                "❌ Nie można utworzyć kolejnej nagrywki, dopóki poprzednia nie zostanie zakończona.\n\n"
+                f"🎬 **{recording_display_name(existing_recording)}**\n"
+                f"📅 {existing_recording['data']} • 🕒 {existing_recording['godzina']}\n"
+                f"🔖 ID: `{existing_id}`\n\n"
+                "Najpierw użyj `/zakoncznagrywke` albo `/odwolajnagrywke`."
+            ),
+            ephemeral=True
+        )
+        return
+
     try:
         termin = datetime.strptime(
             f"{data} {godzina}",
@@ -2072,6 +2108,31 @@ async def nagrywka(
     new_recording["message_id"] = message.id
     await message.edit(embed=build_recording_embed(new_recording))
 
+    # Zapis musi powstać zanim użytkownicy będą mogli kliknąć reakcję.
+    # Wcześniej tworzenie postów forum opóźniało zapis o kilka sekund,
+    # więc szybkie reakcje trafiały do zwykłych logów i nie były liczone.
+    nagrywki = load_recordings()
+    nagrywki[str(message.id)] = {
+        "opis": opis,
+        "recording_number": recording_number,
+        "message_id": message.id,
+        "data": data,
+        "godzina": godzina,
+        "timestamp": termin.isoformat(),
+        "uczestnicy": [],
+        "reminder_sent": False,
+        "started": False,
+        "forum_thread_ids": [],
+        "forums_closed": False,
+        "report_sent": False,
+        "missing_response_reminder_sent": False,
+        "voice_seconds": {},
+        "voice_joined_at": {},
+        "first_voice_join_at": {},
+        "voice_exit_events": []
+    }
+    save_recordings(nagrywki)
+
     await message.add_reaction("✅")
 
     post_title = recording_forum_title(data)
@@ -2095,29 +2156,13 @@ async def nagrywka(
         except discord.HTTPException as error:
             print(f"❌ Nie udało się utworzyć postu na forum {forum_id}: {error}")
 
-    nagrywki = load_recordings()
-
-    nagrywki[str(message.id)] = {
-        "opis": opis,
-        "recording_number": recording_number,
-        "message_id": message.id,
-        "data": data,
-        "godzina": godzina,
-        "timestamp": termin.isoformat(),
-        "uczestnicy": [],
-        "reminder_sent": False,
-        "started": False,
-        "forum_thread_ids": forum_thread_ids,
-        "forums_closed": False,
-        "report_sent": False,
-        "missing_response_reminder_sent": False,
-        "voice_seconds": {},
-        "voice_joined_at": {},
-        "first_voice_join_at": {},
-        "voice_exit_events": []
-    }
-
-    save_recordings(nagrywki)
+    # Aktualizujemy wyłącznie ID postów, aby nie nadpisać reakcjami zapisanymi
+    # równolegle podczas tworzenia postów na forum.
+    await asyncio.to_thread(
+        recordings_collection.update_one,
+        {"message_id": message.id},
+        {"$set": {"forum_thread_ids": forum_thread_ids}}
+    )
 
     await interaction.followup.send(
         f"✅ Utworzono nagrywkę.\n"
@@ -2916,6 +2961,166 @@ async def usunobecnosc(
     await send_response(interaction, result, ephemeral=True)
 
 @bot.tree.command(
+    name="statusnagrywki",
+    description="Pokazuje aktualny stan trwającej nagrywki"
+)
+async def statusnagrywki(interaction: discord.Interaction):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    nagrywki = await asyncio.to_thread(load_recordings)
+    if not nagrywki:
+        await interaction.followup.send("❌ Brak aktywnej nagrywki.", ephemeral=True)
+        return
+
+    started_recordings = [
+        (message_id, recording)
+        for message_id, recording in nagrywki.items()
+        if recording.get("started", False)
+    ]
+
+    if started_recordings:
+        message_id, nagrywka = min(
+            started_recordings,
+            key=lambda item: item[1].get("timestamp", "")
+        )
+    else:
+        message_id, nagrywka = min(
+            nagrywki.items(),
+            key=lambda item: item[1].get("timestamp", "")
+        )
+
+    try:
+        termin = datetime.fromisoformat(nagrywka["timestamp"])
+        if termin.tzinfo is None:
+            termin = termin.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+    except (KeyError, TypeError, ValueError):
+        await interaction.followup.send("❌ Termin nagrywki ma nieprawidłowe dane.", ephemeral=True)
+        return
+
+    now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    if not nagrywka.get("started", False) or now < termin:
+        embed = discord.Embed(
+            title=f"🕒 {recording_display_name(nagrywka).upper()} — OCZEKUJE",
+            description="Nagrywka nie została jeszcze rozpoczęta.",
+            color=discord.Color.blue(),
+            timestamp=now
+        )
+        embed.add_field(name="📅 Data", value=f"**{nagrywka['data']}**", inline=True)
+        embed.add_field(name="🕒 Godzina", value=f"**{nagrywka['godzina']}**", inline=True)
+        embed.add_field(name="⏳ Rozpoczęcie", value=f"<t:{int(termin.timestamp())}:R>", inline=True)
+        embed.add_field(
+            name="✅ Potwierdzone osoby",
+            value=f"**{len(nagrywka.get('uczestnicy', []))}**",
+            inline=False
+        )
+        embed.set_footer(text=f"ID terminu: {message_id}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    guild = interaction.guild
+    allowed_role_ids = {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
+    eligible_ids = {
+        member.id
+        for role_id in allowed_role_ids
+        for member in (guild.get_role(role_id).members if guild.get_role(role_id) else [])
+        if not member.bot
+    }
+
+    voice_channel = guild.get_channel(NAGRYWKI_VC_ID)
+    current_ids = {
+        member.id
+        for member in (voice_channel.members if isinstance(voice_channel, discord.VoiceChannel) else [])
+        if member.id in eligible_ids
+    }
+
+    live_seconds = {
+        int(user_id): int(seconds)
+        for user_id, seconds in nagrywka.get("voice_seconds", {}).items()
+        if int(user_id) in eligible_ids
+    }
+    for user_id, joined_text in nagrywka.get("voice_joined_at", {}).items():
+        try:
+            user_id_int = int(user_id)
+            if user_id_int not in eligible_ids:
+                continue
+            joined_time = datetime.fromisoformat(joined_text)
+            if joined_time.tzinfo is None:
+                joined_time = joined_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+            live_seconds[user_id_int] = live_seconds.get(user_id_int, 0) + max(
+                0, int((now - joined_time).total_seconds())
+            )
+        except (TypeError, ValueError):
+            continue
+
+    qualified_ids = {
+        user_id for user_id, seconds in live_seconds.items()
+        if seconds >= MIN_VC_ATTENDANCE_SECONDS
+    }
+    late_lines = []
+    for user_id, joined_text in nagrywka.get("first_voice_join_at", {}).items():
+        try:
+            user_id_int = int(user_id)
+            if user_id_int not in eligible_ids:
+                continue
+            joined_time = datetime.fromisoformat(joined_text)
+            if joined_time.tzinfo is None:
+                joined_time = joined_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+            late_seconds = int((joined_time - termin).total_seconds())
+            if late_seconds > 0:
+                late_lines.append(f"<@{user_id_int}> — **{(late_seconds + 59) // 60} min**")
+        except (TypeError, ValueError):
+            continue
+
+    registered_ids = set(nagrywka.get("uczestnicy", [])) & eligible_ids
+    registered_missing_ids = registered_ids - current_ids
+
+    def mentions(user_ids, empty_text="Brak"):
+        return "\n".join(f"<@{user_id}>" for user_id in sorted(user_ids))[:1024] or empty_text
+
+    elapsed_minutes = max(0, int((now - termin).total_seconds() // 60))
+    elapsed_hours, remaining_minutes = divmod(elapsed_minutes, 60)
+    elapsed_text = (
+        f"{elapsed_hours} godz. {remaining_minutes} min"
+        if elapsed_hours else f"{remaining_minutes} min"
+    )
+
+    embed = discord.Embed(
+        title=f"🔴 {recording_display_name(nagrywka).upper()} — TRWA",
+        description=f"Nagrywka trwa już **{elapsed_text}**.",
+        color=discord.Color.red(),
+        timestamp=now
+    )
+    embed.add_field(
+        name=f"🔊 Aktualnie na VC ({len(current_ids)})",
+        value=mentions(current_ids, "Nikt z ekipy nie znajduje się obecnie na VC."),
+        inline=False
+    )
+    embed.add_field(
+        name=f"✅ Zaliczone 35 minut ({len(qualified_ids)})",
+        value=mentions(qualified_ids, "Nikt nie zaliczył jeszcze wymaganego czasu."),
+        inline=False
+    )
+    embed.add_field(
+        name=f"⏰ Spóźnieni ({len(late_lines)})",
+        value="\n".join(late_lines)[:1024] or "Brak spóźnień.",
+        inline=False
+    )
+    embed.add_field(
+        name=f"⚠️ Zapisani, których nie ma ({len(registered_missing_ids)})",
+        value=mentions(registered_missing_ids, "Wszyscy zapisani są obecnie na VC."),
+        inline=False
+    )
+    embed.set_footer(text=f"ID terminu: {message_id} • Dane aktualne w chwili użycia komendy")
+    await interaction.followup.send(
+        embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+@bot.tree.command(
     name="zakoncznagrywke",
     description="Kończy aktywną nagrywkę"
 )
@@ -3145,6 +3350,15 @@ async def statystyki(
     interaction: discord.Interaction,
     user: discord.Member = None
 ):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(
+            interaction,
+            "❌ Komenda `/statystyki` jest dostępna wyłącznie dla administracji. "
+            f"Swoje podsumowanie możesz sprawdzić na kanale <#{PERSONAL_STATS_CHANNEL_ID}>.",
+            ephemeral=True
+        )
+        return
+
     if user is not None and user.id == KACIEJ_USER_ID:
         await send_response(
             interaction,
