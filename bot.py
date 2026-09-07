@@ -1498,13 +1498,97 @@ async def refresh_active_recording_messages():
 async def sync_recording_reactions():
     """Synchronizuje uczestników w MongoDB z reakcjami pod aktywnym terminem."""
     nagrywki = await asyncio.to_thread(load_recordings)
-    if not nagrywki:
-        return
-
     channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
     if channel is None:
         print(f"❌ Synchronizacja reakcji: brak kanału {NAGRYWKI_CHANNEL_ID}")
         return
+
+    # Jeżeli rekord aktywnej nagrywki zniknął z MongoDB, odtwórz go z
+    # najnowszej niezakończonej wiadomości na kanale terminów.
+    if not nagrywki:
+        try:
+            recovered_message = None
+            async for candidate in channel.history(limit=50):
+                if candidate.author.id != bot.user.id or not candidate.embeds:
+                    continue
+
+                title = candidate.embeds[0].title or ""
+                upper_title = title.upper()
+                if (
+                    "NAGRYWKA #" in upper_title
+                    and "ODWOŁANA" not in upper_title
+                    and "ZAKOŃCZONA" not in upper_title
+                ):
+                    recovered_message = candidate
+                    break
+
+            if recovered_message is None:
+                print("⚠️ Synchronizacja reakcji: brak aktywnego rekordu i wiadomości do odzyskania")
+                return
+
+            recovered_embed = recovered_message.embeds[0]
+            recovered_data = None
+            recovered_time = None
+            for field in recovered_embed.fields:
+                if "Data" in field.name:
+                    recovered_data = field.value.replace("**", "").strip()
+                elif "Godzina" in field.name:
+                    recovered_time = field.value.replace("**", "").strip()
+
+            if not recovered_data or not recovered_time:
+                print("❌ Synchronizacja reakcji: wiadomość nie zawiera daty lub godziny")
+                return
+
+            termin = datetime.strptime(
+                f"{recovered_data} {recovered_time}", "%d.%m.%Y %H:%M"
+            ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+            try:
+                recording_number = int(
+                    recovered_embed.title.split("#", 1)[1].split()[0]
+                )
+            except (IndexError, TypeError, ValueError):
+                recording_number = await asyncio.to_thread(next_recording_number)
+
+            recovered_recording = {
+                "opis": f"Nagrywka #{recording_number}",
+                "recording_number": recording_number,
+                "message_id": recovered_message.id,
+                "data": recovered_data,
+                "godzina": recovered_time,
+                "timestamp": termin.isoformat(),
+                "uczestnicy": [],
+                "reminder_sent": False,
+                "started": datetime.now(ZoneInfo("Europe/Warsaw")) >= termin,
+                "forum_thread_ids": [],
+                "forums_closed": False,
+                "report_sent": False,
+                "missing_response_reminder_sent": False,
+                "voice_seconds": {},
+                "voice_joined_at": {},
+                "first_voice_join_at": {},
+                "voice_exit_events": []
+            }
+            recovered_recording["forum_thread_ids"] = await find_recording_forum_threads(
+                recovered_recording
+            )
+            await asyncio.to_thread(
+                recordings_collection.update_one,
+                {"message_id": recovered_message.id},
+                {"$set": recovered_recording},
+                upsert=True
+            )
+            nagrywki = {str(recovered_message.id): recovered_recording}
+            print(
+                f"✅ Odzyskano aktywną nagrywkę {recovered_message.id} "
+                "z wiadomości Discorda"
+            )
+
+        except Exception as error:
+            print(
+                "❌ Nie udało się odzyskać aktywnej nagrywki: "
+                f"{type(error).__name__}: {error}"
+            )
+            return
 
     for message_id, nagrywka in nagrywki.items():
         try:
