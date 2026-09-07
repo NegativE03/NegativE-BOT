@@ -2179,6 +2179,44 @@ async def check_recordings():
 
     for message_id, nagrywka in list(nagrywki.items()):
 
+        # Co minutę synchronizuj zapisy z faktycznymi reakcjami Discorda.
+        # Naprawia to również reakcje pominięte przez event podczas tworzenia
+        # nagrywki albo krótkiej przerwy w działaniu bota.
+        recording_channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+        if recording_channel is not None:
+            try:
+                recording_message = await recording_channel.fetch_message(int(message_id))
+                reaction_participants = []
+
+                for reaction in recording_message.reactions:
+                    if str(reaction.emoji) != "✅":
+                        continue
+
+                    async for reacting_user in reaction.users():
+                        if reacting_user.bot:
+                            continue
+
+                        reacting_member = recording_message.guild.get_member(reacting_user.id)
+                        if reacting_member and any(
+                            role.id == URLOP_ROLE_ID for role in reacting_member.roles
+                        ):
+                            continue
+
+                        reaction_participants.append(reacting_user.id)
+
+                reaction_participants = list(dict.fromkeys(reaction_participants))
+                if set(reaction_participants) != set(nagrywka.get("uczestnicy", [])):
+                    nagrywka["uczestnicy"] = reaction_participants
+                    await recording_message.edit(embed=build_recording_embed(nagrywka))
+                    changed = True
+                    print(
+                        f"✅ Zsynchronizowano reakcje nagrywki {message_id}: "
+                        f"{len(reaction_participants)} osób"
+                    )
+
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się zsynchronizować reakcji nagrywki {message_id}: {error}")
+
         termin = datetime.fromisoformat(
             nagrywka["timestamp"]
         )
