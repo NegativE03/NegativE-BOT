@@ -122,6 +122,9 @@ async def on_ready():
     if not check_recordings.is_running():
         check_recordings.start()
 
+    if not sync_recording_reactions_loop.is_running():
+        sync_recording_reactions_loop.start()
+
     if not check_vacations.is_running():
         check_vacations.start()
 
@@ -1491,6 +1494,67 @@ async def refresh_active_recording_messages():
 
     if recordings_changed:
         await asyncio.to_thread(save_recordings, nagrywki)
+
+async def sync_recording_reactions():
+    """Synchronizuje uczestników w MongoDB z reakcjami pod aktywnym terminem."""
+    nagrywki = await asyncio.to_thread(load_recordings)
+    if not nagrywki:
+        return
+
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    if channel is None:
+        print(f"❌ Synchronizacja reakcji: brak kanału {NAGRYWKI_CHANNEL_ID}")
+        return
+
+    for message_id, nagrywka in nagrywki.items():
+        try:
+            message = await channel.fetch_message(int(message_id))
+            participant_ids = []
+
+            for reaction in message.reactions:
+                if str(reaction.emoji) != "✅":
+                    continue
+
+                async for reacting_user in reaction.users(limit=None):
+                    if reacting_user.bot:
+                        continue
+
+                    member = message.guild.get_member(reacting_user.id)
+                    if member and any(role.id == URLOP_ROLE_ID for role in member.roles):
+                        continue
+
+                    participant_ids.append(reacting_user.id)
+
+            participant_ids = list(dict.fromkeys(participant_ids))
+            if set(participant_ids) == set(nagrywka.get("uczestnicy", [])):
+                continue
+
+            await asyncio.to_thread(
+                recordings_collection.update_one,
+                {"message_id": int(message_id)},
+                {"$set": {"uczestnicy": participant_ids}}
+            )
+            nagrywka["uczestnicy"] = participant_ids
+            nagrywka["message_id"] = int(message_id)
+            await message.edit(embed=build_recording_embed(nagrywka))
+            print(
+                f"✅ Synchronizacja reakcji {message_id}: "
+                f"zapisano {len(participant_ids)} osób"
+            )
+
+        except Exception as error:
+            print(
+                f"❌ Synchronizacja reakcji {message_id} nie powiodła się: "
+                f"{type(error).__name__}: {error}"
+            )
+
+@tasks.loop(seconds=30)
+async def sync_recording_reactions_loop():
+    await sync_recording_reactions()
+
+@sync_recording_reactions_loop.before_loop
+async def before_sync_recording_reactions_loop():
+    await bot.wait_until_ready()
 
 async def collect_absence_authors(thread_ids):
     authors_by_forum = {forum_id: set() for forum_id in NIEOBECNOSCI_FORUM_IDS}
