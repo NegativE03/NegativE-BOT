@@ -694,6 +694,25 @@ async def update_server_status():
         message = await channel.send(embed=embed)
         STATUS_MESSAGE_ID = message.id
 
+@update_server_status.before_loop
+async def before_update_server_status():
+    await bot.wait_until_ready()
+
+@update_server_status.error
+async def update_server_status_error(error):
+    print(
+        "❌ Pętla statusu Kaciej Arcade zatrzymała się: "
+        f"{type(error).__name__}: {error}"
+    )
+
+    async def restart_status_loop():
+        await asyncio.sleep(10)
+        if not bot.is_closed() and not update_server_status.is_running():
+            print("🔄 Ponowne uruchamianie pętli statusu Kaciej Arcade")
+            update_server_status.start()
+
+    asyncio.create_task(restart_status_loop())
+
 # Logi wiadomości
 MESSAGE_LOGS_CHANNEL_ID = 1513882214188978288
 
