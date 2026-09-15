@@ -66,8 +66,20 @@ async def send_response(interaction: discord.Interaction, *args, **kwargs):
     return await interaction.response.send_message(*args, **kwargs)
 
 async def defer_slow_interaction(interaction: discord.Interaction):
-    """Zapobiega komunikatowi „aplikacja nie odpowiada” dla wolniejszych komend."""
-    await asyncio.sleep(2)
+    """Natychmiast potwierdza komendę Discordowi, zanim rozpocznie się wolniejsza praca."""
+    command_name = (interaction.data or {}).get("name")
+    commands_with_own_initial_response = {
+        "ticket",
+        "clear",
+        "nadajurlop",
+        "zakonczurlop",
+        "nagrywka",
+        "statusnagrywki",
+        "raportbrakuodpowiedzi"
+    }
+    if command_name in commands_with_own_initial_response:
+        return
+
     try:
         if not interaction.response.is_done():
             await interaction.response.defer()
@@ -2337,6 +2349,77 @@ async def nagrywka(
         ephemeral=True
     )
 
+async def send_missing_response_report(nagrywka, guild, manual_by=None):
+    missing_by_role = await get_missing_recording_members(nagrywka, guild)
+    report_channel = bot.get_channel(REPORT_CHANNEL_ID)
+    if report_channel is None:
+        return False
+
+    report_embed = discord.Embed(
+        title="⚠️ Brak potwierdzenia obecności",
+        description=(
+            f"🎬 **{recording_display_name(nagrywka)}**\n"
+            f"📅 {nagrywka['data']} o {nagrywka['godzina']} (Europe/Warsaw)\n\n"
+            "Poniższe osoby nie dały reakcji ✅, nie zgłosiły nieobecności "
+            "i nie mają aktywnego urlopu."
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    for role_id, label in (
+        (NAGRYWKOWICZE_ROLE_ID, "🎬 Pomocnicy"),
+        (TESTOWI_ROLE_ID, "🧪 Testowi")
+    ):
+        members = missing_by_role.get(role_id, [])
+        value = "\n".join(member.mention for member in members) or "✅ Wszyscy odpowiedzieli"
+        report_embed.add_field(name=label, value=value[:1024], inline=False)
+
+    if manual_by is None:
+        report_embed.set_footer(text="Raport automatyczny • godzinę przed nagrywką")
+    else:
+        report_embed.set_footer(text=f"Raport ręczny • wywołał {manual_by}")
+
+    await report_channel.send(
+        embed=report_embed,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+    return True
+
+@bot.tree.command(
+    name="raportbrakuodpowiedzi",
+    description="Wysyła raport osób bez potwierdzenia dla aktywnej nagrywki"
+)
+async def raportbrakuodpowiedzi(interaction: discord.Interaction):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    nagrywki = await asyncio.to_thread(load_recordings)
+    if not nagrywki:
+        await interaction.followup.send("❌ Brak aktywnej nagrywki.", ephemeral=True)
+        return
+
+    message_id, nagrywka = next(iter(nagrywki.items()))
+    sent = await send_missing_response_report(
+        nagrywka,
+        interaction.guild,
+        manual_by=interaction.user.display_name
+    )
+    if not sent:
+        await interaction.followup.send("❌ Nie znaleziono kanału raportów.", ephemeral=True)
+        return
+
+    await asyncio.to_thread(
+        recordings_collection.update_one,
+        {"message_id": int(message_id)},
+        {"$set": {"report_sent": True}}
+    )
+    await interaction.followup.send(
+        f"✅ Raport dla **{recording_display_name(nagrywka)}** został wysłany.",
+        ephemeral=True
+    )
+
 @tasks.loop(minutes=1)
 async def check_recordings():
 
@@ -2484,38 +2567,11 @@ async def check_recordings():
         # RAPORT BRAKU ODPOWIEDZI 1H PRZED
         if (
             not nagrywka.get("report_sent", False)
-            and 0 <= roznica <= 3600
+            and roznica <= 3600
             and bot.get_guild(GUILD_ID) is not None
         ):
             guild = bot.get_guild(GUILD_ID)
-            missing_by_role = await get_missing_recording_members(nagrywka, guild)
-            report_channel = bot.get_channel(REPORT_CHANNEL_ID)
-
-            if report_channel is not None:
-                report_embed = discord.Embed(
-                    title="⚠️ Brak potwierdzenia obecności",
-                    description=(
-                        f"🎬 **{recording_display_name(nagrywka)}**\n"
-                        f"📅 {nagrywka['data']} o {nagrywka['godzina']} (Europe/Warsaw)\n\n"
-                        "Poniższe osoby nie dały reakcji ✅, nie zgłosiły nieobecności "
-                        "i nie mają aktywnego urlopu."
-                    ),
-                    color=discord.Color.orange(),
-                    timestamp=now
-                )
-                for role_id, label in (
-                    (NAGRYWKOWICZE_ROLE_ID, "🎬 Pomocnicy"),
-                    (TESTOWI_ROLE_ID, "🧪 Testowi")
-                ):
-                    members = missing_by_role.get(role_id, [])
-                    value = "\n".join(member.mention for member in members) or "✅ Wszyscy odpowiedzieli"
-                    report_embed.add_field(name=label, value=value[:1024], inline=False)
-
-                report_embed.set_footer(text="Raport automatyczny • godzinę przed nagrywką")
-                await report_channel.send(
-                    embed=report_embed,
-                    allowed_mentions=discord.AllowedMentions.none()
-                )
+            if await send_missing_response_report(nagrywka, guild):
                 nagrywka["report_sent"] = True
                 changed = True
 
@@ -2656,6 +2712,25 @@ async def check_recordings():
     if changed:
 
         save_recordings(nagrywki)
+
+@check_recordings.before_loop
+async def before_check_recordings():
+    await bot.wait_until_ready()
+
+@check_recordings.error
+async def check_recordings_error(error):
+    print(
+        "❌ Pętla nagrywek i przypomnień zatrzymała się: "
+        f"{type(error).__name__}: {error}"
+    )
+
+    async def restart_recordings_loop():
+        await asyncio.sleep(10)
+        if not bot.is_closed() and not check_recordings.is_running():
+            print("🔄 Ponowne uruchamianie pętli nagrywek i przypomnień")
+            check_recordings.start()
+
+    asyncio.create_task(restart_recordings_loop())
 
 def recording_select_options(nagrywki):
     return [
