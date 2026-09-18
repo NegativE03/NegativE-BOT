@@ -83,7 +83,7 @@ async def send_response(interaction: discord.Interaction, *args, **kwargs):
     return await interaction.response.send_message(*args, **kwargs)
 
 async def defer_slow_interaction(interaction: discord.Interaction):
-    """Natychmiast potwierdza komendę Discordowi, zanim rozpocznie się wolniejsza praca."""
+    """Potwierdza komendę na tym samym obiekcie, który trafi do jej callbacku."""
     command_name = (interaction.data or {}).get("name")
     commands_with_own_initial_response = {
         "ticket",
@@ -95,18 +95,16 @@ async def defer_slow_interaction(interaction: discord.Interaction):
         "raportbrakuodpowiedzi"
     }
     if command_name in commands_with_own_initial_response:
-        return
+        return True
 
     try:
         if not interaction.response.is_done():
             await interaction.response.defer()
     except discord.InteractionResponded:
         pass
+    return True
 
-@bot.event
-async def on_interaction(interaction: discord.Interaction):
-    if interaction.type is discord.InteractionType.application_command:
-        asyncio.create_task(defer_slow_interaction(interaction))
+bot.tree.interaction_check = defer_slow_interaction
 
 @bot.event
 async def setup_hook():
