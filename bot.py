@@ -33,6 +33,7 @@ recordings_collection = db["recordings"]
 recording_stats_collection = db["recording_stats"]
 day_member_polls_collection = db["day_member_polls"]
 bot_counters_collection = db["bot_counters"]
+work_credits_collection = db["work_credits"]
 
 from pymongo.errors import PyMongoError
 
@@ -1709,10 +1710,21 @@ async def collect_absence_authors(thread_ids):
 
     return authors_by_forum
 
+async def boss_has_work_credit(nagrywka):
+    work_credit = await asyncio.to_thread(
+        work_credits_collection.find_one,
+        {"user_id": BOSS_USER_ID}
+    )
+    return bool(
+        work_credit
+        and nagrywka.get("data") in work_credit.get("covered_dates", [])
+    )
+
 async def get_missing_recording_members(nagrywka, guild):
     thread_ids = await find_recording_forum_threads(nagrywka)
     absence_authors = await collect_absence_authors(thread_ids)
     confirmed_ids = set(nagrywka.get("uczestnicy", []))
+    boss_covered_by_work = await boss_has_work_credit(nagrywka)
     missing_by_role = {}
 
     for role_id, forum_id in (
@@ -1725,6 +1737,8 @@ async def get_missing_recording_members(nagrywka, guild):
             absent_ids = absence_authors.get(forum_id, set())
             for member in role.members:
                 if member.bot:
+                    continue
+                if member.id == BOSS_USER_ID and boss_covered_by_work:
                     continue
                 if member.id in confirmed_ids or member.id in absent_ids:
                     continue
@@ -1743,6 +1757,9 @@ async def build_recording_statistics(message_id, nagrywka, guild):
         for user_id, seconds in nagrywka.get("voice_seconds", {}).items()
         if seconds >= MIN_VC_ATTENDANCE_SECONDS
     }
+    boss_covered_by_work = await boss_has_work_credit(nagrywka)
+    if boss_covered_by_work:
+        confirmed_ids.add(BOSS_USER_ID)
 
     eligible_ids = set()
     absent_ids = set()
@@ -1763,6 +1780,8 @@ async def build_recording_statistics(message_id, nagrywka, guild):
                 continue
 
             eligible_ids.add(member.id)
+            if member.id == BOSS_USER_ID and boss_covered_by_work:
+                continue
             if any(member_role.id == URLOP_ROLE_ID for member_role in member.roles):
                 vacation_ids.add(member.id)
             elif member.id in forum_absent_ids:
@@ -4207,6 +4226,104 @@ async def zakoncznagrywkowiczdnia(interaction: discord.Interaction):
         interaction,
         "🏆 Wybierz ankietę do zakończenia:",
         view=CloseDayMemberPollView(polls),
+        ephemeral=True
+    )
+
+@bot.tree.command(
+    name="topnagrywkowiczdnia",
+    description="Pokazuje ranking zwycięzców Nagrywkowicza Dnia"
+)
+async def topnagrywkowiczdnia(interaction: discord.Interaction):
+    polls = await asyncio.to_thread(
+        lambda: list(day_member_polls_collection.find(
+            {"guild_id": interaction.guild.id, "closed": True},
+            {"winner_ids": 1}
+        ))
+    )
+
+    wins = {}
+    for poll in polls:
+        for user_id in poll.get("winner_ids", []):
+            user_id = int(user_id)
+            wins[user_id] = wins.get(user_id, 0) + 1
+
+    if not wins:
+        await send_response(
+            interaction,
+            "🏆 Nie ma jeszcze zakończonych ankiet ze zwycięzcą.",
+            ephemeral=True
+        )
+        return
+
+    ranking = sorted(wins.items(), key=lambda item: (-item[1], item[0]))
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for position, (user_id, win_count) in enumerate(ranking[:15], start=1):
+        prefix = medals[position - 1] if position <= 3 else f"`{position}.`"
+        win_word = "zwycięstwo" if win_count == 1 else (
+            "zwycięstwa" if 2 <= win_count % 10 <= 4 and not 12 <= win_count % 100 <= 14
+            else "zwycięstw"
+        )
+        lines.append(f"{prefix} <@{user_id}> — **{win_count} {win_word}**")
+
+    embed = discord.Embed(
+        title="🏆 TOPKA NAGRYWKOWICZA DNIA",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    embed.add_field(
+        name="📊 Podsumowanie",
+        value=f"Zakończone ankiety: **{len(polls)}** • Zwycięzcy w rankingu: **{len(wins)}**",
+        inline=False
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="Każdy remisowy zwycięzca otrzymuje jedno zwycięstwo")
+    await send_response(
+        interaction,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+@bot.tree.command(
+    name="praca",
+    description="Zalicza Twoją obecność przez 5 kolejnych dni roboczych"
+)
+async def praca(interaction: discord.Interaction):
+    if interaction.user.id != BOSS_USER_ID:
+        await send_response(
+            interaction,
+            "❌ Ta komenda jest dostępna wyłącznie dla właściciela.",
+            ephemeral=True
+        )
+        return
+
+    current_date = datetime.now(ZoneInfo("Europe/Warsaw")).date()
+    covered_dates = []
+    candidate_date = current_date
+    while len(covered_dates) < 5:
+        if candidate_date.weekday() < 5:
+            covered_dates.append(candidate_date.strftime("%d.%m.%Y"))
+        candidate_date += timedelta(days=1)
+
+    await asyncio.to_thread(
+        work_credits_collection.update_one,
+        {"user_id": BOSS_USER_ID},
+        {"$set": {
+            "covered_dates": covered_dates,
+            "created_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+        }},
+        upsert=True
+    )
+
+    await send_response(
+        interaction,
+        (
+            "💼 **Tryb pracy został włączony.**\n\n"
+            "Nagrywki w poniższych dniach zostaną automatycznie zaliczone jako obecność:\n"
+            + "\n".join(f"• **{date_text}**" for date_text in covered_dates)
+        ),
         ephemeral=True
     )
 
