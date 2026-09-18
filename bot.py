@@ -62,6 +62,22 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 async def send_response(interaction: discord.Interaction, *args, **kwargs):
     """Odpowiada poprawnie niezależnie od tego, czy interakcja była odroczona."""
+    if interaction.response.type is discord.InteractionResponseType.deferred_channel_message:
+        # Po defer trzeba zakończyć oryginalną odpowiedź. Zwykły follow-up może
+        # pozostawić w Discordzie wiszące „BOT myśli...” bez końca.
+        if kwargs.get("ephemeral", False):
+            try:
+                await interaction.delete_original_response()
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return await interaction.followup.send(*args, **kwargs)
+
+        edit_kwargs = dict(kwargs)
+        edit_kwargs.pop("ephemeral", None)
+        if args:
+            edit_kwargs["content"] = args[0]
+        return await interaction.edit_original_response(**edit_kwargs)
+
     if interaction.response.is_done():
         return await interaction.followup.send(*args, **kwargs)
     return await interaction.response.send_message(*args, **kwargs)
