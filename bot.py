@@ -22,7 +22,8 @@ if not MONGO_URI:
 mongo = MongoClient(
     MONGO_URI,
     serverSelectionTimeoutMS=5000,
-    connectTimeoutMS=5000
+    connectTimeoutMS=5000,
+    socketTimeoutMS=8000
 )
 
 db = mongo["negative_bot"]
@@ -844,9 +845,9 @@ async def on_raw_reaction_add(payload):
     message = await channel.fetch_message(payload.message_id)
 
     # NAGRYWKI
-    if str(payload.message_id) in load_recordings():
+    nagrywki = await asyncio.to_thread(load_recordings)
+    if str(payload.message_id) in nagrywki:
 
-        nagrywki = load_recordings()
         nagrywka = nagrywki[str(payload.message_id)]
 
         if str(payload.emoji) == "✅":
@@ -869,7 +870,7 @@ async def on_raw_reaction_add(payload):
                     payload.user_id
                 )
 
-                save_recordings(nagrywki)
+                await asyncio.to_thread(save_recordings, nagrywki)
 
                 embed = message.embeds[0]
 
@@ -980,9 +981,9 @@ async def on_raw_reaction_remove(payload):
     message = await channel.fetch_message(payload.message_id)
 
     # NAGRYWKI
-    if str(payload.message_id) in load_recordings():
+    nagrywki = await asyncio.to_thread(load_recordings)
+    if str(payload.message_id) in nagrywki:
 
-        nagrywki = load_recordings()
         nagrywka = nagrywki[str(payload.message_id)]
 
         if str(payload.emoji) == "✅":
@@ -993,7 +994,7 @@ async def on_raw_reaction_remove(payload):
                     payload.user_id
                 )
 
-                save_recordings(nagrywki)
+                await asyncio.to_thread(save_recordings, nagrywki)
 
                 embed = message.embeds[0]
 
@@ -1096,7 +1097,7 @@ async def on_raw_reaction_remove(payload):
 async def on_voice_state_update(member, before, after):
 
     if before.channel != after.channel:
-        nagrywki = load_recordings()
+        nagrywki = await asyncio.to_thread(load_recordings)
         tracking_changed = False
         now = datetime.now(ZoneInfo("Europe/Warsaw"))
 
@@ -1213,7 +1214,7 @@ async def on_voice_state_update(member, before, after):
                         )
 
         if tracking_changed:
-            save_recordings(nagrywki)
+            await asyncio.to_thread(save_recordings, nagrywki)
 
     log_channel = bot.get_channel(VC_LOGS_CHANNEL_ID)
 
@@ -2423,7 +2424,7 @@ async def raportbrakuodpowiedzi(interaction: discord.Interaction):
 @tasks.loop(minutes=1)
 async def check_recordings():
 
-    nagrywki = load_recordings()
+    nagrywki = await asyncio.to_thread(load_recordings)
 
     changed = False
 
@@ -2711,7 +2712,7 @@ async def check_recordings():
 
     if changed:
 
-        save_recordings(nagrywki)
+        await asyncio.to_thread(save_recordings, nagrywki)
 
 @check_recordings.before_loop
 async def before_check_recordings():
@@ -3655,9 +3656,25 @@ async def statystyki(
         )
         return
 
-    documents = await asyncio.to_thread(
-        lambda: list(recording_stats_collection.find().sort("timestamp", 1))
-    )
+    try:
+        documents = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: list(
+                    recording_stats_collection.find()
+                    .sort("timestamp", 1)
+                    .max_time_ms(8000)
+                )
+            ),
+            timeout=10
+        )
+    except (asyncio.TimeoutError, PyMongoError) as error:
+        print(f"❌ Nie udało się pobrać statystyk: {type(error).__name__}: {error}")
+        await send_response(
+            interaction,
+            "❌ Baza danych odpowiada zbyt wolno. Spróbuj ponownie za chwilę.",
+            ephemeral=True
+        )
+        return
 
     if not documents:
         await send_response(
