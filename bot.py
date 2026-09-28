@@ -34,8 +34,9 @@ recording_stats_collection = db["recording_stats"]
 day_member_polls_collection = db["day_member_polls"]
 bot_counters_collection = db["bot_counters"]
 work_credits_collection = db["work_credits"]
+recording_locks_collection = db["recording_locks"]
 
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 try:
     mongo.admin.command("ping")
@@ -1964,6 +1965,27 @@ def save_recordings(data):
             upsert=True
         )
 
+def refresh_recording_lock(recordings):
+    """Utrzymuje atomową blokadę zgodnie z faktyczną listą aktywnych nagrywek."""
+    if not recordings:
+        recording_locks_collection.delete_one({"_id": "active_recording"})
+        return
+
+    message_id, recording = next(iter(recordings.items()))
+    recording_locks_collection.update_one(
+        {"_id": "active_recording"},
+        {
+            "$set": {
+                "message_id": int(message_id),
+                "timestamp": recording.get("timestamp"),
+                "data": recording.get("data"),
+                "godzina": recording.get("godzina")
+            },
+            "$unset": {"expires_at": ""}
+        },
+        upsert=True
+    )
+
 @bot.tree.command(
     name="nadajurlop",
     description="Nadaje urlop nagrywkowiczowi"
@@ -2297,6 +2319,37 @@ async def nagrywka(
 
         return
 
+    # Atomowa blokada zapobiega dwóm równoczesnym wywołaniom /nagrywka.
+    # Zwykłe wcześniejsze sprawdzenie listy nie wystarczało, gdy dwóch
+    # administratorów uruchomiło komendę niemal w tej samej chwili.
+    reservation_now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    try:
+        await asyncio.to_thread(
+            recording_locks_collection.find_one_and_update,
+            {
+                "_id": "active_recording",
+                "expires_at": {"$lt": reservation_now}
+            },
+            {
+                "$set": {
+                    "timestamp": termin.isoformat(),
+                    "data": data,
+                    "godzina": godzina,
+                    "reserved_by": interaction.user.id,
+                    "expires_at": reservation_now + timedelta(minutes=5)
+                }
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER
+        )
+    except DuplicateKeyError:
+        await interaction.followup.send(
+            "❌ Inny termin jest właśnie tworzony albo aktywna nagrywka już istnieje. "
+            "Nie można utworzyć tego samego terminu drugi raz.",
+            ephemeral=True
+        )
+        return
+
     channel = bot.get_channel(
         NAGRYWKI_CHANNEL_ID
     )
@@ -2345,6 +2398,15 @@ async def nagrywka(
         "voice_exit_events": []
     }
     save_recordings(nagrywki)
+
+    await asyncio.to_thread(
+        recording_locks_collection.update_one,
+        {"_id": "active_recording"},
+        {
+            "$set": {"message_id": message.id, "timestamp": termin.isoformat()},
+            "$unset": {"expires_at": ""}
+        }
+    )
 
     await message.add_reaction("✅")
 
@@ -3057,6 +3119,7 @@ class CancelRecordingSelect(Select):
         save_recordings(
             nagrywki
         )
+        await asyncio.to_thread(refresh_recording_lock, nagrywki)
 
 
         await send_response(interaction,
@@ -3107,6 +3170,125 @@ async def odwolajnagrywke(
     await send_response(interaction,
         "🎬 Wybierz nagrywkę:",
         view=CancelRecordingView(),
+        ephemeral=True
+    )
+
+class DeleteRecordingSelect(Select):
+    def __init__(self, recordings):
+        super().__init__(
+            placeholder="Wybierz zbugowany termin do trwałego usunięcia...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=recording_display_name(recording)[:100],
+                    description=(
+                        f"{recording.get('data', '')} • {recording.get('godzina', '')} "
+                        f"• ID: {message_id}"
+                    )[:100],
+                    value=message_id
+                )
+                for message_id, recording in list(recordings.items())[:25]
+            ]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != BOSS_USER_ID:
+            await send_response(
+                interaction,
+                "❌ Tylko właściciel może usuwać terminy.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        message_id = self.values[0]
+        recordings = await asyncio.to_thread(load_recordings)
+        recording = recordings.get(message_id)
+        if recording is None:
+            await interaction.edit_original_response(
+                content="❌ Ten termin nie jest już aktywny.",
+                view=None
+            )
+            return
+
+        removed_message = False
+        removed_threads = 0
+        channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+        if channel is not None:
+            try:
+                message = await channel.fetch_message(int(message_id))
+                await message.delete(reason=f"Zbugowany termin usunięty przez {interaction.user}")
+                removed_message = True
+            except discord.NotFound:
+                removed_message = True
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się usunąć wiadomości terminu {message_id}: {error}")
+
+        for thread_id in await find_recording_forum_threads(recording):
+            try:
+                thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+                await thread.delete(reason=f"Zbugowany termin usunięty przez {interaction.user}")
+                removed_threads += 1
+            except discord.NotFound:
+                removed_threads += 1
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się usunąć postu nieobecności {thread_id}: {error}")
+
+        await asyncio.to_thread(
+            recordings_collection.delete_one,
+            {"message_id": int(message_id)}
+        )
+        recordings.pop(message_id, None)
+        await asyncio.to_thread(refresh_recording_lock, recordings)
+
+        details = []
+        if not removed_message:
+            details.append("nie udało się usunąć wiadomości z kanału")
+        if removed_threads < len(recording.get("forum_thread_ids", [])):
+            details.append("nie udało się usunąć wszystkich postów nieobecności")
+        warning = f"\n⚠️ {'; '.join(details)}." if details else ""
+
+        await interaction.edit_original_response(
+            content=(
+                f"✅ Trwale usunięto **{recording_display_name(recording)}** "
+                f"({recording.get('data')} • {recording.get('godzina')})."
+                f"{warning}"
+            ),
+            view=None
+        )
+
+class DeleteRecordingView(View):
+    def __init__(self, recordings):
+        super().__init__(timeout=120)
+        self.add_item(DeleteRecordingSelect(recordings))
+
+@bot.tree.command(
+    name="usuntermin",
+    description="Trwale usuwa wybrany zbugowany termin nagrywki"
+)
+async def usuntermin(interaction: discord.Interaction):
+    if interaction.user.id != BOSS_USER_ID:
+        await send_response(
+            interaction,
+            "❌ Ta komenda jest dostępna wyłącznie dla właściciela.",
+            ephemeral=True
+        )
+        return
+
+    recordings = await asyncio.to_thread(load_recordings)
+    if not recordings:
+        await send_response(
+            interaction,
+            "❌ Brak aktywnych terminów do usunięcia.",
+            ephemeral=True
+        )
+        return
+
+    await send_response(
+        interaction,
+        "🗑️ Wybierz zbugowany termin, który mam trwale usunąć:",
+        view=DeleteRecordingView(recordings),
         ephemeral=True
     )
 
@@ -3545,6 +3727,7 @@ async def zakoncznagrywke(
     save_recordings(
         nagrywki
     )
+    await asyncio.to_thread(refresh_recording_lock, nagrywki)
 
 
     await send_response(interaction,
