@@ -2640,6 +2640,8 @@ async def build_recording_statistics(message_id, nagrywka, guild):
         "message_id": int(message_id),
         "opis": recording_display_name(nagrywka),
         "recording_number": nagrywka.get("recording_number"),
+        "double_group_id": nagrywka.get("double_group_id"),
+        "double_position": nagrywka.get("double_position"),
         "data": nagrywka["data"],
         "godzina": nagrywka["godzina"],
         "timestamp": nagrywka["timestamp"],
@@ -5207,6 +5209,140 @@ async def ensure_personal_stats_panel():
     except (discord.Forbidden, discord.HTTPException) as error:
         print(f"❌ Nie udało się utworzyć panelu statystyk: {error}")
 
+class DeleteRecordingStatisticsSelect(Select):
+    def __init__(self, documents):
+        self.documents = {
+            str(document["message_id"]): document for document in documents
+        }
+        super().__init__(
+            placeholder="Wybierz błędną nagrywkę do usunięcia ze statystyk...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=recording_display_name(document)[:100],
+                    description=(
+                        f"{document.get('data', 'brak daty')} • "
+                        f"{document.get('godzina', 'brak godziny')} • "
+                        f"obecni: {len(document.get('confirmed_ids', []))} • "
+                        f"ID: {document['message_id']}"
+                    )[:100],
+                    value=str(document["message_id"]),
+                    emoji="🗑️"
+                )
+                for document in documents[:25]
+            ]
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != BOSS_USER_ID:
+            await send_response(
+                interaction,
+                "❌ Ta komenda jest dostępna wyłącznie dla właściciela.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message_id = int(self.values[0])
+        document = self.documents.get(str(message_id))
+        if document is None:
+            await interaction.edit_original_response(
+                content="❌ Nie znaleziono wybranego rekordu statystyk.",
+                view=None
+            )
+            return
+
+        result = await asyncio.to_thread(
+            recording_stats_collection.delete_one,
+            {"_id": document["_id"]}
+        )
+        if result.deleted_count == 0:
+            await interaction.edit_original_response(
+                content="❌ Ten rekord został już wcześniej usunięty.",
+                view=None
+            )
+            return
+
+        log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+        if log_channel is not None:
+            log_embed = discord.Embed(
+                title="🗑️ Usunięto statystyki nagrywki",
+                description=f"**{recording_display_name(document)}**",
+                color=discord.Color.red(),
+                timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+            )
+            log_embed.add_field(
+                name="📅 Termin",
+                value=f"{document.get('data', 'brak')} • {document.get('godzina', 'brak')}",
+                inline=True
+            )
+            log_embed.add_field(
+                name="👥 Zapisana obecność",
+                value=str(len(document.get("confirmed_ids", []))),
+                inline=True
+            )
+            log_embed.add_field(
+                name="👤 Usunął",
+                value=interaction.user.mention,
+                inline=False
+            )
+            log_embed.set_footer(text=f"ID statystyk: {message_id}")
+            try:
+                await log_channel.send(
+                    embed=log_embed,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        await interaction.edit_original_response(
+            content=(
+                f"✅ Usunięto **{recording_display_name(document)}** "
+                f"({document.get('data', 'brak daty')} o "
+                f"{document.get('godzina', 'brak godziny')}) ze wszystkich statystyk."
+            ),
+            view=None
+        )
+
+class DeleteRecordingStatisticsView(View):
+    def __init__(self, documents):
+        super().__init__(timeout=120)
+        self.add_item(DeleteRecordingStatisticsSelect(documents))
+
+@bot.tree.command(
+    name="usunstatystyki",
+    description="Trwale usuwa błędną nagrywkę ze statystyk"
+)
+async def usunstatystyki(interaction: discord.Interaction):
+    if interaction.user.id != BOSS_USER_ID:
+        await send_response(
+            interaction,
+            "❌ Ta komenda jest dostępna wyłącznie dla właściciela.",
+            ephemeral=True
+        )
+        return
+
+    documents = await asyncio.to_thread(
+        lambda: list(
+            recording_stats_collection.find().sort("timestamp", -1).limit(25)
+        )
+    )
+    if not documents:
+        await send_response(
+            interaction,
+            "❌ Nie ma żadnych zakończonych nagrywek w statystykach.",
+            ephemeral=True
+        )
+        return
+
+    await send_response(
+        interaction,
+        "🗑️ Wybierz błędną nagrywkę. Jej rekord zostanie trwale usunięty ze statystyk:",
+        view=DeleteRecordingStatisticsView(documents),
+        ephemeral=True
+    )
+
 @bot.tree.command(
     name="statystyki",
     description="Pokazuje statystyki zakończonych nagrywek"
@@ -5608,6 +5744,52 @@ async def check_day_member_polls():
         except (KeyError, TypeError, ValueError) as error:
             print(f"❌ Błędne dane ankiety Nagrywkowicza Dnia: {error}")
 
+def combine_day_member_recordings(documents):
+    combined = []
+    double_groups = {}
+    for document in documents:
+        group_id = document.get("double_group_id")
+        if group_id:
+            double_groups.setdefault(group_id, []).append(document)
+        else:
+            combined.append(document)
+
+    for group_id, stages in double_groups.items():
+        # Ankietę X2 pokazujemy dopiero po zakończeniu obu etapów, żeby lista
+        # kandydatów zawierała wszystkich faktycznie obecnych tego dnia.
+        positions = {
+            int(stage.get("double_position", 0)) for stage in stages
+        }
+        if positions != {1, 2}:
+            continue
+        stages = sorted(stages, key=lambda item: item.get("double_position", 0))
+        first, second = stages
+        confirmed_ids = sorted({
+            int(user_id)
+            for stage in stages
+            for user_id in stage.get("confirmed_ids", [])
+        })
+        first_name = recording_display_name(first)
+        second_name = recording_display_name(second)
+        combined.append({
+            "message_id": int(first["message_id"]),
+            "opis": f"Nagrywka X2 — {first_name} + {second_name}",
+            "data": first.get("data", second.get("data", "")),
+            "godzina": first.get("godzina", ""),
+            "timestamp": first.get("timestamp", ""),
+            "confirmed_ids": confirmed_ids,
+            "double_group_id": group_id,
+            "double_stage_message_ids": [
+                int(first["message_id"]), int(second["message_id"])
+            ]
+        })
+
+    return sorted(
+        combined,
+        key=lambda item: item.get("timestamp", ""),
+        reverse=True
+    )
+
 class DayMemberRecordingSelect(Select):
     def __init__(self, documents):
         self.documents = {str(doc["message_id"]): doc for doc in documents}
@@ -5722,6 +5904,7 @@ async def nagrywkowiczdnia(interaction: discord.Interaction):
     documents = await asyncio.to_thread(
         lambda: list(recording_stats_collection.find().sort("timestamp", -1).limit(25))
     )
+    documents = combine_day_member_recordings(documents)
     if not documents:
         await send_response(interaction, "❌ Brak zakończonych nagrywek.", ephemeral=True)
         return
