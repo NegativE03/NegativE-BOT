@@ -1123,6 +1123,8 @@ async def on_voice_state_update(member, before, after):
         now = datetime.now(ZoneInfo("Europe/Warsaw"))
 
         for nagrywka in nagrywki.values():
+            if nagrywka.get("stage_waiting", False):
+                continue
             joined_at = nagrywka.setdefault("voice_joined_at", {})
             voice_seconds = nagrywka.setdefault("voice_seconds", {})
             first_joined_at = nagrywka.setdefault("first_voice_join_at", {})
@@ -1398,8 +1400,9 @@ def double_recording_forum_content(recordings):
     first, second = recordings
     return (
         "🎬 **Podwójna nagrywka — zgłoszenie nieobecności**\n\n"
-        f"1️⃣ **{recording_display_name(first)}:** {first['data']} • {first['godzina']}\n"
-        f"2️⃣ **{recording_display_name(second)}:** {second['data']} • {second['godzina']}\n"
+        f"📅 **Start całości:** {first['data']} • {first['godzina']}\n"
+        f"1️⃣ **{recording_display_name(first)}:** od rozpoczęcia nagrywki\n"
+        f"2️⃣ **{recording_display_name(second)}:** po zakończeniu etapu 1/2\n"
         f"🔊 **Kanał VC:** <#{NAGRYWKI_VC_ID}>\n\n"
         "Aby zgłosić nieobecność, wybierz z listy pierwszy termin, drugi termin albo oba. "
         "Sama wiadomość tekstowa nie przypisze nieobecności do żadnego terminu."
@@ -1417,13 +1420,13 @@ class DoubleAbsenceSelect(Select):
             options=[
                 discord.SelectOption(
                     label=f"Tylko {recording_display_name(first)}"[:100],
-                    description=f"{first['data']} • {first['godzina']}",
+                    description="Etap 1/2 — od rozpoczęcia nagrywki",
                     value=str(first["message_id"]),
                     emoji="1️⃣"
                 ),
                 discord.SelectOption(
                     label=f"Tylko {recording_display_name(second)}"[:100],
-                    description=f"{second['data']} • {second['godzina']}",
+                    description="Etap 2/2 — po zakończeniu pierwszego etapu",
                     value=str(second["message_id"]),
                     emoji="2️⃣"
                 ),
@@ -1503,23 +1506,30 @@ def build_double_recording_embed(recordings):
     embed = discord.Embed(
         title="🎬 PODWÓJNA NAGRYWKA",
         description=(
-            "### 📢 Dwa terminy — dwie osobne obecności\n"
+            "### 📢 Jeden start — dwa etapy i dwie osobne obecności\n"
             "Wybierz przyciskiem, czy będziesz na obu, tylko na jednej albo się spóźnisz."
         ),
         color=discord.Color.blurple()
     )
-    for position, recording in enumerate(recordings, start=1):
+    for fallback_position, recording in enumerate(recordings, start=1):
+        position = int(recording.get("double_position", fallback_position))
         try:
             timestamp = datetime.fromisoformat(recording["timestamp"])
             relative = f"<t:{int(timestamp.timestamp())}:R>"
         except (KeyError, TypeError, ValueError):
             relative = "brak danych"
         participant_count = len(recording.get("uczestnicy", []))
+        if recording.get("stage_waiting", False):
+            timing_text = "▶️ **Start po zakończeniu etapu 1/2**"
+        else:
+            timing_text = (
+                f"📅 **{recording['data']}** • 🕒 **{recording['godzina']}**\n"
+                f"⏳ {relative}"
+            )
         embed.add_field(
             name=f"{position}️⃣ {recording_display_name(recording)}",
             value=(
-                f"📅 **{recording['data']}** • 🕒 **{recording['godzina']}**\n"
-                f"⏳ {relative}\n"
+                f"{timing_text}\n"
                 f"✅ Zapisani: **{participant_count} {polish_people_word(participant_count)}**"
             ),
             inline=False
@@ -1608,10 +1618,15 @@ async def update_double_lateness_report(group_id, recordings):
             entries.append(
                 f"<@{choice['user_id']}> — {choice['late_reason']}"
             )
+        stage_timing = (
+            f"{recording['data']} o {recording['godzina']}"
+            if position == 1 else
+            "po zakończeniu etapu 1/2"
+        )
         embed.add_field(
             name=(
                 f"{position}/2 • {recording_display_name(recording)} • "
-                f"{recording['data']} o {recording['godzina']}"
+                f"{stage_timing}"
             ),
             value=("\n".join(entries)[:1024] if entries else "Brak zgłoszonych spóźnień."),
             inline=False
@@ -1760,7 +1775,11 @@ class DoubleAttendanceTermSelect(Select):
         options = [
             discord.SelectOption(
                 label=f"{recording_display_name(recording)}"[:100],
-                description=f"{recording['data']} • {recording['godzina']}",
+                description=(
+                    f"{recording['data']} • {recording['godzina']}"
+                    if position == 1 else
+                    "Rozpocznie się po zakończeniu etapu 1/2"
+                ),
                 value=str(recording["message_id"]),
                 emoji=f"{position}️⃣"
             )
@@ -3050,14 +3069,12 @@ async def nagrywka(
 )
 @app_commands.describe(
     data="Data obu nagrywek (DD.MM.RRRR)",
-    godzina1="Godzina pierwszej nagrywki (HH:MM)",
-    godzina2="Godzina drugiej nagrywki (HH:MM)"
+    godzina="Godzina rozpoczęcia podwójnej nagrywki (HH:MM)"
 )
 async def nagrywkax2(
     interaction: discord.Interaction,
     data: str,
-    godzina1: str,
-    godzina2: str
+    godzina: str
 ):
     if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
         await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
@@ -3074,30 +3091,12 @@ async def nagrywkax2(
 
     try:
         first_time = datetime.strptime(
-            f"{data} {godzina1}", "%d.%m.%Y %H:%M"
-        ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
-        second_time = datetime.strptime(
-            f"{data} {godzina2}", "%d.%m.%Y %H:%M"
+            f"{data} {godzina}", "%d.%m.%Y %H:%M"
         ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
     except ValueError:
         await send_response(
             interaction,
             "❌ Niepoprawna data lub godzina. Przykład: `01.10.2026` i `18:00`.",
-            ephemeral=True
-        )
-        return
-
-    if first_time == second_time:
-        await send_response(
-            interaction,
-            "❌ Pierwsza i druga nagrywka nie mogą mieć identycznej godziny.",
-            ephemeral=True
-        )
-        return
-    if second_time < first_time:
-        await send_response(
-            interaction,
-            "❌ Drugi termin musi być późniejszy od pierwszego.",
             ephemeral=True
         )
         return
@@ -3110,7 +3109,7 @@ async def nagrywkax2(
             {"$set": {
                 "timestamp": first_time.isoformat(),
                 "data": data,
-                "godzina": godzina1,
+                "godzina": godzina,
                 "reserved_by": interaction.user.id,
                 "expires_at": reservation_now + timedelta(minutes=5)
             }},
@@ -3139,8 +3138,8 @@ async def nagrywkax2(
     try:
         recordings = []
         for position, (date_text, time_text, timestamp) in enumerate((
-            (data, godzina1, first_time),
-            (data, godzina2, second_time)
+            (data, godzina, first_time),
+            (data, godzina, first_time)
         ), start=1):
             recording_number = await asyncio.to_thread(next_recording_number)
             recording = {
@@ -3161,7 +3160,8 @@ async def nagrywkax2(
                 "first_voice_join_at": {},
                 "voice_exit_events": [],
                 "double_group_id": group_id,
-                "double_position": position
+                "double_position": position,
+                "stage_waiting": position == 2
             }
             recordings.append(recording)
 
@@ -3354,6 +3354,11 @@ async def check_recordings():
 
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
                 print(f"❌ Nie udało się zsynchronizować reakcji nagrywki {message_id}: {error}")
+
+        # Etap 2/2 nie ma osobnej zaplanowanej godziny. Zaczyna się dokładnie
+        # w chwili zakończenia etapu 1/2 komendą /zakonczetap.
+        if nagrywka.get("stage_waiting", False):
+            continue
 
         termin = datetime.fromisoformat(
             nagrywka["timestamp"]
@@ -4705,6 +4710,25 @@ async def finish_recording(interaction, message_id, nagrywka, nagrywki):
                 and int(sibling.get("double_position", 0)) == 2
             ):
                 sibling["first_stage_completed"] = True
+                sibling["stage_waiting"] = False
+                sibling["started"] = True
+                sibling["timestamp"] = now.isoformat()
+                sibling["stage_started_at"] = now.isoformat()
+                sibling["godzina"] = now.strftime("%H:%M")
+                sibling["voice_seconds"] = {}
+                sibling["voice_joined_at"] = {}
+                sibling["first_voice_join_at"] = {}
+                sibling["voice_exit_events"] = []
+                sibling["reminder_sent"] = True
+                sibling["report_sent"] = True
+                sibling["missing_response_reminder_sent"] = True
+
+                voice_channel = bot.get_channel(NAGRYWKI_VC_ID)
+                if isinstance(voice_channel, discord.VoiceChannel):
+                    for voice_member in voice_channel.members:
+                        user_key = str(voice_member.id)
+                        sibling["voice_joined_at"][user_key] = now.isoformat()
+                        sibling["first_voice_join_at"][user_key] = now.isoformat()
 
     del nagrywki[str(message_id)]
     save_recordings(nagrywki)
