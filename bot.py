@@ -1682,16 +1682,31 @@ async def save_double_attendance_choice(
         await interaction.edit_original_response(content="❌ Ta podwójna nagrywka nie jest już aktywna.")
         return
 
-    await asyncio.to_thread(
-        recordings_collection.update_many,
-        {"double_group_id": group_id},
-        {"$pull": {"uczestnicy": interaction.user.id}}
-    )
-    await asyncio.to_thread(
-        recordings_collection.update_many,
-        {"message_id": {"$in": [int(value) for value in selected_ids]}},
-        {"$addToSet": {"uczestnicy": interaction.user.id}}
-    )
+    selected_id_set = {int(value) for value in selected_ids}
+    for recording in recordings:
+        recording_id = int(recording["message_id"])
+        if recording_id in selected_id_set:
+            update = {
+                "$pull": {"uczestnicy": str(interaction.user.id)}
+            }
+            await asyncio.to_thread(
+                recordings_collection.update_one,
+                {"_id": recording["_id"]},
+                update
+            )
+            await asyncio.to_thread(
+                recordings_collection.update_one,
+                {"_id": recording["_id"]},
+                {"$addToSet": {"uczestnicy": interaction.user.id}}
+            )
+        else:
+            await asyncio.to_thread(
+                recordings_collection.update_one,
+                {"_id": recording["_id"]},
+                {"$pull": {
+                    "uczestnicy": {"$in": [interaction.user.id, str(interaction.user.id)]}
+                }}
+            )
     await asyncio.to_thread(
         recording_attendance_choices_collection.update_one,
         {"group_id": group_id, "user_id": interaction.user.id},
@@ -1725,13 +1740,64 @@ async def save_double_attendance_choice(
         if int(recording["message_id"]) in {int(value) for value in selected_ids}
     ]
     status_text = "obecność" if status == "present" else "spóźnienie"
-    response_text = f"✅ Zapisano **{status_text}**: **{' i '.join(selected_names)}**."
+    counts_text = " • ".join(
+        f"{recording.get('double_position')}/2: **{len(recording.get('uczestnicy', []))}**"
+        for recording in sorted(refreshed, key=lambda item: item.get("double_position", 0))
+    )
+    response_text = (
+        f"✅ Zapisano **{status_text}**: **{' i '.join(selected_names)}**.\n"
+        f"👥 Aktualnie zapisani — {counts_text}"
+    )
     if status == "present" and len(selected_ids) == 1:
         response_text += (
             "\n⚠️ **Na drugi termin musisz zgłosić nieobecność** "
             "w odpowiednim poście nieobecności."
         )
     await interaction.edit_original_response(content=response_text)
+
+    log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+    if log_channel is not None:
+        log_embed = discord.Embed(
+            title=(
+                "⏰ Zgłoszono spóźnienie — nagrywka X2"
+                if status == "late" else
+                "✅ Zapisano obecność — nagrywka X2"
+            ),
+            description=(
+                f"{interaction.user.mention} wybrał(a): "
+                f"**{' i '.join(selected_names)}**."
+            ),
+            color=(
+                discord.Color.orange()
+                if status == "late" else discord.Color.green()
+            ),
+            timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+        )
+        log_embed.add_field(
+            name="📅 Start nagrywki X2",
+            value=f"**{refreshed[0]['data']} o {refreshed[0]['godzina']}**",
+            inline=False
+        )
+        log_embed.add_field(
+            name="👥 Aktualna liczba zapisanych",
+            value=counts_text,
+            inline=False
+        )
+        if late_reason:
+            log_embed.add_field(
+                name="📝 Powód spóźnienia",
+                value=late_reason[:1024],
+                inline=False
+            )
+        log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        log_embed.set_footer(text=f"ID użytkownika: {interaction.user.id}")
+        try:
+            await log_channel.send(
+                embed=log_embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
     await update_double_lateness_report(group_id, refreshed)
 
