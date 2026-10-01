@@ -3049,16 +3049,14 @@ async def nagrywka(
     description="Tworzy dwa powiązane terminy nagrywek i wspólne nieobecności"
 )
 @app_commands.describe(
-    data1="Data pierwszej nagrywki (DD.MM.RRRR)",
+    data="Data obu nagrywek (DD.MM.RRRR)",
     godzina1="Godzina pierwszej nagrywki (HH:MM)",
-    data2="Data drugiej nagrywki (DD.MM.RRRR)",
     godzina2="Godzina drugiej nagrywki (HH:MM)"
 )
 async def nagrywkax2(
     interaction: discord.Interaction,
-    data1: str,
+    data: str,
     godzina1: str,
-    data2: str,
     godzina2: str
 ):
     if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
@@ -3076,10 +3074,10 @@ async def nagrywkax2(
 
     try:
         first_time = datetime.strptime(
-            f"{data1} {godzina1}", "%d.%m.%Y %H:%M"
+            f"{data} {godzina1}", "%d.%m.%Y %H:%M"
         ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
         second_time = datetime.strptime(
-            f"{data2} {godzina2}", "%d.%m.%Y %H:%M"
+            f"{data} {godzina2}", "%d.%m.%Y %H:%M"
         ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
     except ValueError:
         await send_response(
@@ -3092,7 +3090,7 @@ async def nagrywkax2(
     if first_time == second_time:
         await send_response(
             interaction,
-            "❌ Pierwsza i druga nagrywka nie mogą mieć identycznej daty oraz godziny.",
+            "❌ Pierwsza i druga nagrywka nie mogą mieć identycznej godziny.",
             ephemeral=True
         )
         return
@@ -3111,7 +3109,7 @@ async def nagrywkax2(
             {"_id": "active_recording", "expires_at": {"$lt": reservation_now}},
             {"$set": {
                 "timestamp": first_time.isoformat(),
-                "data": data1,
+                "data": data,
                 "godzina": godzina1,
                 "reserved_by": interaction.user.id,
                 "expires_at": reservation_now + timedelta(minutes=5)
@@ -3141,8 +3139,8 @@ async def nagrywkax2(
     try:
         recordings = []
         for position, (date_text, time_text, timestamp) in enumerate((
-            (data1, godzina1, first_time),
-            (data2, godzina2, second_time)
+            (data, godzina1, first_time),
+            (data, godzina2, second_time)
         ), start=1):
             recording_number = await asyncio.to_thread(next_recording_number)
             recording = {
@@ -3184,10 +3182,7 @@ async def nagrywkax2(
         await asyncio.to_thread(save_recordings, recordings_data)
         await asyncio.to_thread(refresh_recording_lock, recordings_data)
 
-        if data1 == data2:
-            post_title = f"Nieobecność X2 {data1} — {POLISH_WEEKDAYS[first_time.weekday()]}"
-        else:
-            post_title = f"Nieobecność X2 {data1} + {data2}"
+        post_title = f"Nieobecność X2 {data} — {POLISH_WEEKDAYS[first_time.weekday()]}"
 
         forum_thread_ids = []
         for forum_id in NIEOBECNOSCI_FORUM_IDS:
@@ -3794,6 +3789,14 @@ class CancelRecordingSelect(Select):
 
         nagrywka = nagrywki[message_id]
 
+        if nagrywka.get("double_group_id"):
+            await send_response(
+                interaction,
+                "❌ Podwójną nagrywkę odwołujesz komendą `/odwolajx2`.",
+                ephemeral=True
+            )
+            return
+
         channel = bot.get_channel(
             NAGRYWKI_CHANNEL_ID
         )
@@ -3969,7 +3972,8 @@ async def odwolajnagrywke(
         return
 
 
-    if len(load_recordings()) == 0:
+    active_recordings = load_recordings()
+    if len(active_recordings) == 0:
 
         await send_response(interaction,
             "❌ Brak aktywnych nagrywek.",
@@ -3978,10 +3982,191 @@ async def odwolajnagrywke(
 
         return
 
+    if all(recording.get("double_group_id") for recording in active_recordings.values()):
+        await send_response(
+            interaction,
+            "❌ To jest podwójna nagrywka. Użyj `/odwolajx2` i wybierz odpowiedni zakres.",
+            ephemeral=True
+        )
+        return
+
 
     await send_response(interaction,
         "🎬 Wybierz nagrywkę:",
         view=CancelRecordingView(),
+        ephemeral=True
+    )
+
+async def cancel_double_recording(interaction, recordings, only_second_stage=False):
+    recordings = sorted(
+        recordings,
+        key=lambda item: int(item.get("double_position", 0))
+    )
+    target = recordings[-1] if only_second_stage else recordings[0]
+    announcement_id = int(target["announcement_message_id"])
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+
+    if channel is not None:
+        try:
+            message = await channel.fetch_message(announcement_id)
+            if only_second_stage:
+                title = "❌ ETAP 2/2 ODWOŁANY"
+                description = (
+                    "Etap **1/2** został wcześniej zakończony. "
+                    "Drugi etap podwójnej nagrywki nie odbędzie się."
+                )
+            else:
+                title = "❌ PODWÓJNA NAGRYWKA ODWOŁANA"
+                description = "Oba etapy nagrywki zostały odwołane."
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                color=discord.Color.red(),
+                timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+            )
+            for recording in recordings:
+                if only_second_stage and int(recording.get("double_position", 0)) != 2:
+                    continue
+                embed.add_field(
+                    name=f"🎬 Etap {recording.get('double_position')}/2 — {recording_display_name(recording)}",
+                    value=f"📅 **{recording['data']}** • 🕒 **{recording['godzina']}**",
+                    inline=False
+                )
+            embed.add_field(
+                name="👤 Odwołano przez",
+                value=interaction.user.mention,
+                inline=False
+            )
+            embed.set_footer(text=f"NegativE* • Grupa: {target['double_group_id']}")
+            await message.edit(embed=embed, view=None)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    thread_ids = set()
+    participant_ids = set()
+    for recording in recordings:
+        if only_second_stage and int(recording.get("double_position", 0)) != 2:
+            continue
+        thread_ids.update(await find_recording_forum_threads(recording))
+        participant_ids.update(recording.get("uczestnicy", []))
+
+    for thread_id in thread_ids:
+        try:
+            thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+            await thread.edit(
+                archived=True,
+                locked=True,
+                reason=f"Nagrywka X2 odwołana przez {interaction.user}"
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Nie udało się zamknąć postu nieobecności X2 {thread_id}: {error}")
+
+    for user_id in participant_ids:
+        user = bot.get_user(int(user_id))
+        if user is None:
+            continue
+        try:
+            await user.send(
+                "📢 **Zmiana w podwójnej nagrywce**\n\n"
+                + (
+                    "Etap **2/2** został odwołany."
+                    if only_second_stage else
+                    "Cała podwójna nagrywka została odwołana."
+                )
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+    if log_channel is not None:
+        log_embed = discord.Embed(
+            title=(
+                "❌ Odwołano etap 2/2 nagrywki X2"
+                if only_second_stage else
+                "❌ Odwołano całą nagrywkę X2"
+            ),
+            description="\n".join(
+                f"• **{recording_display_name(recording)}** — {recording['data']} o {recording['godzina']}"
+                for recording in recordings
+                if not only_second_stage or int(recording.get("double_position", 0)) == 2
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+        )
+        log_embed.add_field(name="Odwołał", value=interaction.user.mention)
+        await log_channel.send(
+            embed=log_embed,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    active_recordings = load_recordings()
+    group_id = target["double_group_id"]
+    for message_id, recording in list(active_recordings.items()):
+        if recording.get("double_group_id") != group_id:
+            continue
+        if only_second_stage and int(recording.get("double_position", 0)) != 2:
+            continue
+        del active_recordings[message_id]
+    save_recordings(active_recordings)
+    await asyncio.to_thread(refresh_recording_lock, active_recordings)
+
+@bot.tree.command(
+    name="odwolajx2",
+    description="Odwołuje całą nagrywkę X2 albo tylko etap 2/2"
+)
+@app_commands.describe(zakres="Wybierz, co chcesz odwołać")
+@app_commands.choices(zakres=[
+    app_commands.Choice(name="Cała nagrywka X2", value="all"),
+    app_commands.Choice(name="Tylko etap 2/2", value="second")
+])
+async def odwolajx2(
+    interaction: discord.Interaction,
+    zakres: app_commands.Choice[str]
+):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    recordings = [
+        recording for recording in load_recordings().values()
+        if recording.get("double_group_id")
+    ]
+    if not recordings:
+        await send_response(
+            interaction,
+            "❌ Brak aktywnej podwójnej nagrywki.",
+            ephemeral=True
+        )
+        return
+
+    only_second_stage = zakres.value == "second"
+    if only_second_stage:
+        second_stage = next(
+            (
+                recording for recording in recordings
+                if int(recording.get("double_position", 0)) == 2
+            ),
+            None
+        )
+        if second_stage is None:
+            await send_response(interaction, "❌ Etap 2/2 nie jest aktywny.", ephemeral=True)
+            return
+        if not second_stage.get("first_stage_completed"):
+            await send_response(
+                interaction,
+                "⛔ Etap 2/2 można odwołać osobno dopiero po zakończeniu 1/2 komendą `/zakonczetap`.",
+                ephemeral=True
+            )
+            return
+
+    await cancel_double_recording(interaction, recordings, only_second_stage)
+    await send_response(
+        interaction,
+        (
+            "✅ Etap **2/2** został odwołany, a posty nieobecności zamknięte."
+            if only_second_stage else
+            "✅ Cała nagrywka X2 została odwołana, a posty nieobecności zamknięte."
+        ),
         ephemeral=True
     )
 
@@ -4509,6 +4694,17 @@ async def finish_recording(interaction, message_id, nagrywka, nagrywki):
         await send_recording_completion_report(
             message_id, nagrywka, statistics, now
         )
+
+    if (
+        nagrywka.get("double_group_id")
+        and int(nagrywka.get("double_position", 0)) == 1
+    ):
+        for sibling in nagrywki.values():
+            if (
+                sibling.get("double_group_id") == nagrywka["double_group_id"]
+                and int(sibling.get("double_position", 0)) == 2
+            ):
+                sibling["first_stage_completed"] = True
 
     del nagrywki[str(message_id)]
     save_recordings(nagrywki)
