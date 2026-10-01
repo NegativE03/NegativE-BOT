@@ -35,6 +35,9 @@ day_member_polls_collection = db["day_member_polls"]
 bot_counters_collection = db["bot_counters"]
 work_credits_collection = db["work_credits"]
 recording_locks_collection = db["recording_locks"]
+recording_absences_collection = db["recording_absences"]
+recording_attendance_choices_collection = db["recording_attendance_choices"]
+recording_lateness_reports_collection = db["recording_lateness_reports"]
 
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -117,6 +120,8 @@ async def setup_hook():
         print(cmd.name)
 
     await restore_day_member_poll_views()
+    await restore_double_absence_views()
+    await restore_double_attendance_views()
     bot.add_view(PersonalStatsView())
 
 
@@ -1389,6 +1394,481 @@ def recording_forum_content(opis, data, godzina):
         "Jeżeli nie możesz pojawić się na nagrywce, zgłoś swoją nieobecność w tym poście."
     )
 
+def double_recording_forum_content(recordings):
+    first, second = recordings
+    return (
+        "🎬 **Podwójna nagrywka — zgłoszenie nieobecności**\n\n"
+        f"1️⃣ **{recording_display_name(first)}:** {first['data']} • {first['godzina']}\n"
+        f"2️⃣ **{recording_display_name(second)}:** {second['data']} • {second['godzina']}\n"
+        f"🔊 **Kanał VC:** <#{NAGRYWKI_VC_ID}>\n\n"
+        "Aby zgłosić nieobecność, wybierz z listy pierwszy termin, drugi termin albo oba. "
+        "Sama wiadomość tekstowa nie przypisze nieobecności do żadnego terminu."
+    )
+
+class DoubleAbsenceSelect(Select):
+    def __init__(self, group_id, recordings):
+        self.group_id = group_id
+        self.recordings = recordings
+        first, second = recordings
+        super().__init__(
+            placeholder="Wybierz termin, na którym Cię nie będzie...",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=f"Tylko {recording_display_name(first)}"[:100],
+                    description=f"{first['data']} • {first['godzina']}",
+                    value=str(first["message_id"]),
+                    emoji="1️⃣"
+                ),
+                discord.SelectOption(
+                    label=f"Tylko {recording_display_name(second)}"[:100],
+                    description=f"{second['data']} • {second['godzina']}",
+                    value=str(second["message_id"]),
+                    emoji="2️⃣"
+                ),
+                discord.SelectOption(
+                    label="Obie nagrywki",
+                    description="Nie będzie mnie na żadnym z dwóch terminów",
+                    value="both",
+                    emoji="⏩"
+                )
+            ],
+            custom_id=f"double_absence:{group_id}"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        allowed_roles = {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
+        if not any(role.id in allowed_roles for role in interaction.user.roles):
+            await interaction.edit_original_response(
+                content="❌ To zgłoszenie jest dostępne tylko dla pomocników i testowych."
+            )
+            return
+
+        selected_ids = (
+            [int(recording["message_id"]) for recording in self.recordings]
+            if self.values[0] == "both"
+            else [int(self.values[0])]
+        )
+        forum_id = interaction.channel.parent_id
+        await asyncio.to_thread(
+            recording_absences_collection.update_one,
+            {
+                "group_id": self.group_id,
+                "user_id": interaction.user.id,
+                "forum_id": forum_id
+            },
+            {"$set": {
+                "recording_message_ids": selected_ids,
+                "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+            }},
+            upsert=True
+        )
+        selected_names = [
+            recording_display_name(recording)
+            for recording in self.recordings
+            if int(recording["message_id"]) in selected_ids
+        ]
+        await interaction.edit_original_response(
+            content="✅ Zapisano nieobecność: **" + " i ".join(selected_names) + "**."
+        )
+
+class DoubleAbsenceView(View):
+    def __init__(self, group_id, recordings):
+        super().__init__(timeout=None)
+        self.add_item(DoubleAbsenceSelect(group_id, recordings))
+
+async def restore_double_absence_views():
+    documents = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": {"$exists": True}}))
+    )
+    groups = {}
+    for document in documents:
+        groups.setdefault(document["double_group_id"], []).append(document)
+
+    for group_id, recordings in groups.items():
+        if len(recordings) != 2:
+            continue
+        recordings.sort(key=lambda item: item.get("timestamp", ""))
+        thread_ids = recordings[0].get("forum_thread_ids", [])
+        for thread_id in thread_ids:
+            bot.add_view(
+                DoubleAbsenceView(group_id, recordings),
+                message_id=int(thread_id)
+            )
+
+def build_double_recording_embed(recordings):
+    recordings = sorted(recordings, key=lambda item: item.get("double_position", 0))
+    embed = discord.Embed(
+        title="🎬 PODWÓJNA NAGRYWKA",
+        description=(
+            "### 📢 Dwa terminy — dwie osobne obecności\n"
+            "Wybierz przyciskiem, czy będziesz na obu, tylko na jednej albo się spóźnisz."
+        ),
+        color=discord.Color.blurple()
+    )
+    for position, recording in enumerate(recordings, start=1):
+        try:
+            timestamp = datetime.fromisoformat(recording["timestamp"])
+            relative = f"<t:{int(timestamp.timestamp())}:R>"
+        except (KeyError, TypeError, ValueError):
+            relative = "brak danych"
+        participant_count = len(recording.get("uczestnicy", []))
+        embed.add_field(
+            name=f"{position}️⃣ {recording_display_name(recording)}",
+            value=(
+                f"📅 **{recording['data']}** • 🕒 **{recording['godzina']}**\n"
+                f"⏳ {relative}\n"
+                f"✅ Zapisani: **{participant_count} {polish_people_word(participant_count)}**"
+            ),
+            inline=False
+        )
+    embed.add_field(
+        name="🔊 Miejsce spotkania",
+        value=f"<#{NAGRYWKI_VC_ID}>",
+        inline=False
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="NegativE* • Każdy termin jest liczony osobno w statystykach")
+    return embed
+
+async def refresh_double_announcement_after_removal(recording, remaining_recordings, action):
+    group_id = recording.get("double_group_id")
+    if not group_id:
+        return
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(int(recording["announcement_message_id"]))
+        remaining = sorted(
+            [
+                item for item in remaining_recordings.values()
+                if item.get("double_group_id") == group_id
+            ],
+            key=lambda item: item.get("double_position", 0)
+        )
+        if remaining:
+            embed = build_double_recording_embed(remaining)
+            embed.description = (
+                f"### {action}: {recording_display_name(recording)}\n"
+                "Poniżej pozostały aktywny termin z podwójnej nagrywki."
+            )
+        else:
+            embed = discord.Embed(
+                title="✅ PODWÓJNA NAGRYWKA ZAKOŃCZONA",
+                description="Oba terminy zostały zakończone albo usunięte.",
+                color=discord.Color.green(),
+                timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+            )
+        await message.edit(embed=embed, view=None)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
+async def update_double_lateness_report(group_id, recordings):
+    recordings = sorted(recordings, key=lambda item: item.get("double_position", 0))
+    choices = await asyncio.to_thread(
+        lambda: list(recording_attendance_choices_collection.find({
+            "group_id": group_id,
+            "status": "late",
+            "late_reason": {"$nin": [None, ""]}
+        }))
+    )
+    report_data = await asyncio.to_thread(
+        recording_lateness_reports_collection.find_one,
+        {"group_id": group_id}
+    )
+    if not choices and not report_data:
+        return
+
+    report_channel = bot.get_channel(REPORT_CHANNEL_ID)
+    if report_channel is None:
+        return
+
+    embed = discord.Embed(
+        title="⏰ RAPORT SPÓŹNIEŃ — NAGRYWKA X2",
+        description=(
+            "Zbiorcza lista zapowiedzianych spóźnień. "
+            "Raport aktualizuje się po każdym nowym zgłoszeniu."
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    for position, recording in enumerate(recordings, start=1):
+        recording_id = int(recording["message_id"])
+        entries = []
+        for choice in choices:
+            selected_ids = {
+                int(value) for value in choice.get("recording_message_ids", [])
+            }
+            if recording_id not in selected_ids:
+                continue
+            entries.append(
+                f"<@{choice['user_id']}> — {choice['late_reason']}"
+            )
+        embed.add_field(
+            name=(
+                f"{position}/2 • {recording_display_name(recording)} • "
+                f"{recording['data']} o {recording['godzina']}"
+            ),
+            value=("\n".join(entries)[:1024] if entries else "Brak zgłoszonych spóźnień."),
+            inline=False
+        )
+    embed.set_footer(text="NegativE* • Aktualizowany raport administracyjny")
+
+    report_message = None
+    if report_data and report_data.get("message_id"):
+        try:
+            report_message = await report_channel.fetch_message(
+                int(report_data["message_id"])
+            )
+            await report_message.edit(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            await asyncio.to_thread(
+                recording_lateness_reports_collection.update_one,
+                {"group_id": group_id},
+                {"$set": {
+                    "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+                }}
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            report_message = None
+
+    if report_message is None:
+        try:
+            report_message = await report_channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            return
+        await asyncio.to_thread(
+            recording_lateness_reports_collection.update_one,
+            {"group_id": group_id},
+            {"$set": {
+                "message_id": report_message.id,
+                "channel_id": report_channel.id,
+                "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+            }},
+            upsert=True
+        )
+
+async def save_double_attendance_choice(
+    interaction, group_id, selected_ids, status, late_reason=None
+):
+    recordings = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": group_id}))
+    )
+    if len(recordings) != 2:
+        await interaction.edit_original_response(content="❌ Ta podwójna nagrywka nie jest już aktywna.")
+        return
+
+    await asyncio.to_thread(
+        recordings_collection.update_many,
+        {"double_group_id": group_id},
+        {"$pull": {"uczestnicy": interaction.user.id}}
+    )
+    await asyncio.to_thread(
+        recordings_collection.update_many,
+        {"message_id": {"$in": [int(value) for value in selected_ids]}},
+        {"$addToSet": {"uczestnicy": interaction.user.id}}
+    )
+    await asyncio.to_thread(
+        recording_attendance_choices_collection.update_one,
+        {"group_id": group_id, "user_id": interaction.user.id},
+        {"$set": {
+            "recording_message_ids": [int(value) for value in selected_ids],
+            "status": status,
+            "late_reason": late_reason,
+            "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+        }},
+        upsert=True
+    )
+
+    refreshed = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": group_id}))
+    )
+    announcement_id = int(refreshed[0]["announcement_message_id"])
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    if channel is not None:
+        try:
+            announcement = await channel.fetch_message(announcement_id)
+            await announcement.edit(
+                embed=build_double_recording_embed(refreshed),
+                view=DoubleAttendanceView(group_id, refreshed)
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    selected_names = [
+        recording_display_name(recording)
+        for recording in refreshed
+        if int(recording["message_id"]) in {int(value) for value in selected_ids}
+    ]
+    status_text = "obecność" if status == "present" else "spóźnienie"
+    response_text = f"✅ Zapisano **{status_text}**: **{' i '.join(selected_names)}**."
+    if status == "present" and len(selected_ids) == 1:
+        response_text += (
+            "\n⚠️ **Na drugi termin musisz zgłosić nieobecność** "
+            "w odpowiednim poście nieobecności."
+        )
+    await interaction.edit_original_response(content=response_text)
+
+    await update_double_lateness_report(group_id, refreshed)
+
+class DoubleLateReasonModal(Modal, title="Powód spóźnienia"):
+    reason = TextInput(
+        label="Dlaczego się spóźnisz?",
+        placeholder="Wpisz powód spóźnienia...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        min_length=3,
+        max_length=500
+    )
+
+    def __init__(self, group_id, selected_ids):
+        super().__init__()
+        self.group_id = group_id
+        self.selected_ids = selected_ids
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reason = str(self.reason.value).strip()
+        if len(reason) < 3:
+            await interaction.response.send_message(
+                "❌ Podaj prawdziwy powód spóźnienia (minimum 3 znaki).",
+                ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await save_double_attendance_choice(
+            interaction,
+            self.group_id,
+            self.selected_ids,
+            "late",
+            late_reason=reason
+        )
+
+class DoubleAttendanceTermSelect(Select):
+    def __init__(self, group_id, recordings, status):
+        self.group_id = group_id
+        self.status = status
+        recordings = sorted(recordings, key=lambda item: item.get("double_position", 0))
+        options = [
+            discord.SelectOption(
+                label=f"{recording_display_name(recording)}"[:100],
+                description=f"{recording['data']} • {recording['godzina']}",
+                value=str(recording["message_id"]),
+                emoji=f"{position}️⃣"
+            )
+            for position, recording in enumerate(recordings, start=1)
+        ]
+        if status == "late":
+            options.append(discord.SelectOption(
+                label="Spóźnię się na obie",
+                value="both",
+                emoji="⏰"
+            ))
+        super().__init__(
+            placeholder=(
+                "Wybierz nagrywkę, na której będziesz..."
+                if status == "present" else "Wybierz nagrywkę, na którą się spóźnisz..."
+            ),
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+        self.recordings = recordings
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_ids = (
+            [int(recording["message_id"]) for recording in self.recordings]
+            if self.values[0] == "both" else [int(self.values[0])]
+        )
+        if self.status == "late":
+            await interaction.response.send_modal(
+                DoubleLateReasonModal(self.group_id, selected_ids)
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await save_double_attendance_choice(
+            interaction, self.group_id, selected_ids, self.status
+        )
+
+class DoubleAttendanceTermView(View):
+    def __init__(self, group_id, recordings, status):
+        super().__init__(timeout=120)
+        self.add_item(DoubleAttendanceTermSelect(group_id, recordings, status))
+
+class DoubleAttendanceView(View):
+    def __init__(self, group_id, recordings):
+        super().__init__(timeout=None)
+        self.group_id = group_id
+        self.recordings = sorted(recordings, key=lambda item: item.get("double_position", 0))
+
+    @discord.ui.button(
+        label="Obecny na obu",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="double_attendance:both"
+    )
+    async def present_both(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await save_double_attendance_choice(
+            interaction,
+            self.group_id,
+            [int(recording["message_id"]) for recording in self.recordings],
+            "present"
+        )
+
+    @discord.ui.button(
+        label="Obecny tylko na jednej",
+        emoji="1️⃣",
+        style=discord.ButtonStyle.primary,
+        custom_id="double_attendance:one"
+    )
+    async def present_one(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(
+            (
+                "Wybierz termin, na którym będziesz obecny.\n"
+                "⚠️ Na drugi termin musisz później zgłosić nieobecność "
+                "w odpowiednim poście."
+            ),
+            view=DoubleAttendanceTermView(self.group_id, self.recordings, "present"),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Spóźnię się",
+        emoji="⏰",
+        style=discord.ButtonStyle.secondary,
+        custom_id="double_attendance:late"
+    )
+    async def late(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message(
+            "Na którą nagrywkę się spóźnisz?",
+            view=DoubleAttendanceTermView(self.group_id, self.recordings, "late"),
+            ephemeral=True
+        )
+
+async def restore_double_attendance_views():
+    documents = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": {"$exists": True}}))
+    )
+    groups = {}
+    for document in documents:
+        groups.setdefault(document["double_group_id"], []).append(document)
+    for group_id, recordings in groups.items():
+        if len(recordings) == 2:
+            bot.add_view(
+                DoubleAttendanceView(group_id, recordings),
+                message_id=int(recordings[0]["announcement_message_id"])
+            )
+
 def build_recording_embed(nagrywka):
     try:
         termin = datetime.fromisoformat(nagrywka["timestamp"])
@@ -1496,7 +1976,33 @@ async def refresh_active_recording_messages():
             nagrywka["opis"] = recording_display_name(nagrywka)
             recordings_changed = True
 
-        if channel is not None:
+        is_double = bool(nagrywka.get("double_group_id"))
+        if is_double and nagrywka.get("double_position") != 1:
+            continue
+
+        if is_double and channel is not None:
+            paired_recordings = sorted(
+                [
+                    recording for recording in nagrywki.values()
+                    if recording.get("double_group_id") == nagrywka["double_group_id"]
+                ],
+                key=lambda item: item.get("double_position", 0)
+            )
+            if len(paired_recordings) == 2:
+                try:
+                    message = await channel.fetch_message(
+                        int(nagrywka["announcement_message_id"])
+                    )
+                    await message.edit(
+                        embed=build_double_recording_embed(paired_recordings),
+                        view=DoubleAttendanceView(
+                            nagrywka["double_group_id"], paired_recordings
+                        )
+                    )
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                    print(f"❌ Nie udało się odświeżyć podwójnej nagrywki: {error}")
+
+        if channel is not None and not is_double:
             try:
                 message = await channel.fetch_message(int(message_id))
 
@@ -1532,9 +2038,25 @@ async def refresh_active_recording_messages():
                 if was_archived or was_locked:
                     await thread.edit(archived=False, locked=False)
                 starter_message = await thread.fetch_message(thread.id)
-                await starter_message.edit(content=recording_forum_content(
-                    nagrywka["opis"], nagrywka["data"], nagrywka["godzina"]
-                ))
+                if nagrywka.get("double_group_id"):
+                    paired_recordings = sorted(
+                        [
+                            recording for recording in nagrywki.values()
+                            if recording.get("double_group_id") == nagrywka["double_group_id"]
+                        ],
+                        key=lambda item: item.get("timestamp", "")
+                    )
+                    if len(paired_recordings) == 2:
+                        await starter_message.edit(
+                            content=double_recording_forum_content(paired_recordings),
+                            view=DoubleAbsenceView(
+                                nagrywka["double_group_id"], paired_recordings
+                            )
+                        )
+                else:
+                    await starter_message.edit(content=recording_forum_content(
+                        nagrywka["opis"], nagrywka["data"], nagrywka["godzina"]
+                    ))
                 if was_archived or was_locked:
                     await thread.edit(archived=was_archived, locked=was_locked)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
@@ -1639,6 +2161,8 @@ async def sync_recording_reactions():
             return
 
     for message_id, nagrywka in nagrywki.items():
+        if nagrywka.get("double_group_id"):
+            continue
         try:
             message = await channel.fetch_message(int(message_id))
             participant_ids = []
@@ -1688,8 +2212,21 @@ async def sync_recording_reactions_loop():
 async def before_sync_recording_reactions_loop():
     await bot.wait_until_ready()
 
-async def collect_absence_authors(thread_ids):
+async def collect_absence_authors(thread_ids, nagrywka=None):
     authors_by_forum = {forum_id: set() for forum_id in NIEOBECNOSCI_FORUM_IDS}
+
+    if nagrywka and nagrywka.get("double_group_id"):
+        selections = await asyncio.to_thread(
+            lambda: list(recording_absences_collection.find({
+                "group_id": nagrywka["double_group_id"],
+                "recording_message_ids": int(nagrywka["message_id"])
+            }))
+        )
+        for selection in selections:
+            authors_by_forum.setdefault(int(selection["forum_id"]), set()).add(
+                int(selection["user_id"])
+            )
+        return authors_by_forum
 
     for thread_id in thread_ids:
         thread = bot.get_channel(int(thread_id))
@@ -1711,6 +2248,41 @@ async def collect_absence_authors(thread_ids):
 
     return authors_by_forum
 
+@bot.listen("on_message")
+async def enforce_double_absence_selection(message):
+    if message.author.bot or not isinstance(message.channel, discord.Thread):
+        return
+
+    recording = await asyncio.to_thread(
+        recordings_collection.find_one,
+        {
+            "double_group_id": {"$exists": True},
+            "forum_thread_ids": message.channel.id
+        }
+    )
+    if recording is None:
+        return
+
+    selection = await asyncio.to_thread(
+        recording_absences_collection.find_one,
+        {
+            "group_id": recording["double_group_id"],
+            "user_id": message.author.id,
+            "forum_id": message.channel.parent_id
+        }
+    )
+    if selection is not None:
+        return
+
+    try:
+        await message.delete()
+        await message.author.send(
+            "❌ Najpierw wybierz z listy w poście nieobecności, czy nie będzie Cię "
+            "na pierwszej, drugiej czy obu nagrywkach. Dopiero potem wpisz powód."
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
 async def boss_has_work_credit(nagrywka):
     work_credit = await asyncio.to_thread(
         work_credits_collection.find_one,
@@ -1723,7 +2295,7 @@ async def boss_has_work_credit(nagrywka):
 
 async def get_missing_recording_members(nagrywka, guild):
     thread_ids = await find_recording_forum_threads(nagrywka)
-    absence_authors = await collect_absence_authors(thread_ids)
+    absence_authors = await collect_absence_authors(thread_ids, nagrywka)
     confirmed_ids = set(nagrywka.get("uczestnicy", []))
     boss_covered_by_work = await boss_has_work_credit(nagrywka)
     missing_by_role = {}
@@ -1752,7 +2324,7 @@ async def get_missing_recording_members(nagrywka, guild):
 
 async def build_recording_statistics(message_id, nagrywka, guild):
     thread_ids = await find_recording_forum_threads(nagrywka)
-    absence_authors = await collect_absence_authors(thread_ids)
+    absence_authors = await collect_absence_authors(thread_ids, nagrywka)
     confirmed_ids = {
         int(user_id)
         for user_id, seconds in nagrywka.get("voice_seconds", {}).items()
@@ -1863,9 +2435,15 @@ async def send_recording_completion_report(message_id, nagrywka, statistics, end
     if not present_text:
         present_text = "Brak osób z zaliczonym minimum 35 minut."
 
+    double_position = nagrywka.get("double_position")
+    stage_suffix = f" {double_position}/2" if double_position else ""
     embed = discord.Embed(
-        title=f"📋 RAPORT — {recording_display_name(nagrywka).upper()}",
-        description="Nagrywka została zakończona, a obecność zapisana w statystykach.",
+        title=f"📋 RAPORT{stage_suffix} — {recording_display_name(nagrywka).upper()}",
+        description=(
+            f"Etap **{double_position}/2** został zakończony, a obecność zapisana w statystykach."
+            if double_position else
+            "Nagrywka została zakończona, a obecność zapisana w statystykach."
+        ),
         color=discord.Color.green(),
         timestamp=end_time
     )
@@ -1877,7 +2455,28 @@ async def send_recording_completion_report(message_id, nagrywka, statistics, end
         value=present_text[:1024],
         inline=False
     )
-    embed.set_footer(text=f"ID terminu: {message_id} • Minimum obecności: 35 minut")
+    if nagrywka.get("double_group_id"):
+        lateness_report = await asyncio.to_thread(
+            recording_lateness_reports_collection.find_one,
+            {"group_id": nagrywka["double_group_id"]}
+        )
+        if lateness_report and lateness_report.get("message_id"):
+            lateness_channel_id = int(
+                lateness_report.get("channel_id", REPORT_CHANNEL_ID)
+            )
+            lateness_url = (
+                f"https://discord.com/channels/{GUILD_ID}/"
+                f"{lateness_channel_id}/{int(lateness_report['message_id'])}"
+            )
+            embed.add_field(
+                name="⏰ Spóźnienia",
+                value=f"[Otwórz zbiorczy raport spóźnień]({lateness_url})",
+                inline=False
+            )
+    footer_stage = f" • Etap {double_position}/2" if double_position else ""
+    embed.set_footer(
+        text=f"ID terminu: {message_id}{footer_stage} • Minimum obecności: 35 minut"
+    )
 
     await report_channel.send(
         embed=embed,
@@ -1932,7 +2531,7 @@ def load_recordings():
 
     for doc in recordings_collection.find():
 
-        message_id = str(doc.pop("message_id"))
+        message_id = str(doc["message_id"])
 
         recordings[message_id] = doc
 
@@ -2445,6 +3044,204 @@ async def nagrywka(
         ephemeral=True
     )
 
+@bot.tree.command(
+    name="nagrywkax2",
+    description="Tworzy dwa powiązane terminy nagrywek i wspólne nieobecności"
+)
+@app_commands.describe(
+    data1="Data pierwszej nagrywki (DD.MM.RRRR)",
+    godzina1="Godzina pierwszej nagrywki (HH:MM)",
+    data2="Data drugiej nagrywki (DD.MM.RRRR)",
+    godzina2="Godzina drugiej nagrywki (HH:MM)"
+)
+async def nagrywkax2(
+    interaction: discord.Interaction,
+    data1: str,
+    godzina1: str,
+    data2: str,
+    godzina2: str
+):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    active_recordings = await asyncio.to_thread(load_recordings)
+    if active_recordings:
+        await send_response(
+            interaction,
+            "❌ Najpierw zakończ, odwołaj albo usuń wszystkie aktywne nagrywki.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        first_time = datetime.strptime(
+            f"{data1} {godzina1}", "%d.%m.%Y %H:%M"
+        ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+        second_time = datetime.strptime(
+            f"{data2} {godzina2}", "%d.%m.%Y %H:%M"
+        ).replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+    except ValueError:
+        await send_response(
+            interaction,
+            "❌ Niepoprawna data lub godzina. Przykład: `01.10.2026` i `18:00`.",
+            ephemeral=True
+        )
+        return
+
+    if first_time == second_time:
+        await send_response(
+            interaction,
+            "❌ Pierwsza i druga nagrywka nie mogą mieć identycznej daty oraz godziny.",
+            ephemeral=True
+        )
+        return
+    if second_time < first_time:
+        await send_response(
+            interaction,
+            "❌ Drugi termin musi być późniejszy od pierwszego.",
+            ephemeral=True
+        )
+        return
+
+    reservation_now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    try:
+        await asyncio.to_thread(
+            recording_locks_collection.find_one_and_update,
+            {"_id": "active_recording", "expires_at": {"$lt": reservation_now}},
+            {"$set": {
+                "timestamp": first_time.isoformat(),
+                "data": data1,
+                "godzina": godzina1,
+                "reserved_by": interaction.user.id,
+                "expires_at": reservation_now + timedelta(minutes=5)
+            }},
+            upsert=True,
+            return_document=ReturnDocument.AFTER
+        )
+    except DuplicateKeyError:
+        await send_response(
+            interaction,
+            "❌ Inny termin jest właśnie tworzony albo aktywna nagrywka już istnieje.",
+            ephemeral=True
+        )
+        return
+
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    if channel is None:
+        await asyncio.to_thread(
+            recording_locks_collection.delete_one,
+            {"_id": "active_recording"}
+        )
+        await send_response(interaction, "❌ Nie znaleziono kanału nagrywek.", ephemeral=True)
+        return
+
+    group_id = f"double-{int(reservation_now.timestamp() * 1000000)}"
+    announcement = None
+    try:
+        recordings = []
+        for position, (date_text, time_text, timestamp) in enumerate((
+            (data1, godzina1, first_time),
+            (data2, godzina2, second_time)
+        ), start=1):
+            recording_number = await asyncio.to_thread(next_recording_number)
+            recording = {
+                "opis": f"Nagrywka #{recording_number}",
+                "recording_number": recording_number,
+                "data": date_text,
+                "godzina": time_text,
+                "timestamp": timestamp.isoformat(),
+                "uczestnicy": [],
+                "reminder_sent": False,
+                "started": False,
+                "forum_thread_ids": [],
+                "forums_closed": False,
+                "report_sent": False,
+                "missing_response_reminder_sent": False,
+                "voice_seconds": {},
+                "voice_joined_at": {},
+                "first_voice_join_at": {},
+                "voice_exit_events": [],
+                "double_group_id": group_id,
+                "double_position": position
+            }
+            recordings.append(recording)
+
+        announcement = await channel.send(embed=build_double_recording_embed(recordings))
+        recordings[0]["message_id"] = announcement.id
+        recordings[1]["message_id"] = -announcement.id
+        for recording in recordings:
+            recording["announcement_message_id"] = announcement.id
+
+        await announcement.edit(
+            embed=build_double_recording_embed(recordings),
+            view=DoubleAttendanceView(group_id, recordings)
+        )
+
+        recordings_data = {
+            str(recording["message_id"]): recording for recording in recordings
+        }
+        await asyncio.to_thread(save_recordings, recordings_data)
+        await asyncio.to_thread(refresh_recording_lock, recordings_data)
+
+        if data1 == data2:
+            post_title = f"Nieobecność X2 {data1} — {POLISH_WEEKDAYS[first_time.weekday()]}"
+        else:
+            post_title = f"Nieobecność X2 {data1} + {data2}"
+
+        forum_thread_ids = []
+        for forum_id in NIEOBECNOSCI_FORUM_IDS:
+            forum = bot.get_channel(forum_id)
+            if not isinstance(forum, discord.ForumChannel):
+                print(f"❌ Nie znaleziono forum nieobecności: {forum_id}")
+                continue
+            created_post = await forum.create_thread(
+                name=post_title[:100],
+                content=double_recording_forum_content(recordings),
+                reason=f"Podwójna nagrywka utworzona przez {interaction.user}"
+            )
+            forum_thread_ids.append(created_post.thread.id)
+            starter_message = await created_post.thread.fetch_message(created_post.thread.id)
+            await starter_message.edit(
+                view=DoubleAbsenceView(group_id, recordings)
+            )
+
+        await asyncio.to_thread(
+            recordings_collection.update_many,
+            {"double_group_id": group_id},
+            {"$set": {"forum_thread_ids": forum_thread_ids}}
+        )
+
+        await send_response(
+            interaction,
+            (
+                "✅ Utworzono podwójną nagrywkę z dwiema osobnymi obecnościami.\n"
+                f"📍 {announcement.jump_url}"
+            ),
+            ephemeral=True
+        )
+
+    except Exception as error:
+        print(f"❌ Nie udało się utworzyć podwójnej nagrywki: {type(error).__name__}: {error}")
+        if announcement is not None:
+            try:
+                await announcement.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        await asyncio.to_thread(
+            recordings_collection.delete_many,
+            {"double_group_id": group_id}
+        )
+        await asyncio.to_thread(
+            recording_locks_collection.delete_one,
+            {"_id": "active_recording"}
+        )
+        await send_response(
+            interaction,
+            "❌ Nie udało się utworzyć podwójnej nagrywki. Sprawdź logi bota.",
+            ephemeral=True
+        )
+
 async def send_missing_response_report(nagrywka, guild, manual_by=None):
     missing_by_role = await get_missing_recording_members(nagrywka, guild)
     report_channel = bot.get_channel(REPORT_CHANNEL_ID)
@@ -2529,7 +3326,7 @@ async def check_recordings():
         # Naprawia to również reakcje pominięte przez event podczas tworzenia
         # nagrywki albo krótkiej przerwy w działaniu bota.
         recording_channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
-        if recording_channel is not None:
+        if recording_channel is not None and not nagrywka.get("double_group_id"):
             try:
                 recording_message = await recording_channel.fetch_message(int(message_id))
                 reaction_participants = []
@@ -2851,6 +3648,8 @@ class RecordingActionSelect(Select):
 
     async def callback(self, interaction):
         recording_id = self.values[0]
+        if self.action != "edit":
+            await interaction.response.defer(ephemeral=True, thinking=True)
         if self.action == "remind":
             await przypomnijnagrywke.callback(interaction, recording_id)
         elif self.action == "remove":
@@ -2987,6 +3786,8 @@ class CancelRecordingSelect(Select):
         interaction: discord.Interaction
     ):
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         message_id = self.values[0]
 
         nagrywki = load_recordings()
@@ -3066,8 +3867,16 @@ class CancelRecordingSelect(Select):
             except:
                 pass
 
-        # Zamknij i zablokuj oba posty nieobecności po odwołaniu nagrywki.
-        for thread_id in await find_recording_forum_threads(nagrywka):
+        # Przy X2 wspólny post pozostaje otwarty, dopóki drugi termin jest aktywny.
+        double_sibling_exists = any(
+            other_id != message_id
+            and other.get("double_group_id") == nagrywka.get("double_group_id")
+            for other_id, other in nagrywki.items()
+        ) if nagrywka.get("double_group_id") else False
+        thread_ids_to_close = (
+            [] if double_sibling_exists else await find_recording_forum_threads(nagrywka)
+        )
+        for thread_id in thread_ids_to_close:
             try:
                 thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
                 await thread.edit(
@@ -3120,6 +3929,9 @@ class CancelRecordingSelect(Select):
             nagrywki
         )
         await asyncio.to_thread(refresh_recording_lock, nagrywki)
+        await refresh_double_announcement_after_removal(
+            nagrywka, nagrywki, "Odwołano jeden termin"
+        )
 
 
         await send_response(interaction,
@@ -3214,10 +4026,19 @@ class DeleteRecordingSelect(Select):
 
         removed_message = False
         removed_threads = 0
+        double_sibling_exists = any(
+            other_id != message_id
+            and other.get("double_group_id") == recording.get("double_group_id")
+            for other_id, other in recordings.items()
+        ) if recording.get("double_group_id") else False
         channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
-        if channel is not None:
+        if double_sibling_exists:
+            removed_message = True
+        elif channel is not None:
             try:
-                message = await channel.fetch_message(int(message_id))
+                message = await channel.fetch_message(
+                    int(recording.get("announcement_message_id", message_id))
+                )
                 await message.delete(reason=f"Zbugowany termin usunięty przez {interaction.user}")
                 removed_message = True
             except discord.NotFound:
@@ -3225,7 +4046,10 @@ class DeleteRecordingSelect(Select):
             except (discord.Forbidden, discord.HTTPException) as error:
                 print(f"❌ Nie udało się usunąć wiadomości terminu {message_id}: {error}")
 
-        for thread_id in await find_recording_forum_threads(recording):
+        thread_ids_to_delete = (
+            [] if double_sibling_exists else await find_recording_forum_threads(recording)
+        )
+        for thread_id in thread_ids_to_delete:
             try:
                 thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
                 await thread.delete(reason=f"Zbugowany termin usunięty przez {interaction.user}")
@@ -3241,11 +4065,17 @@ class DeleteRecordingSelect(Select):
         )
         recordings.pop(message_id, None)
         await asyncio.to_thread(refresh_recording_lock, recordings)
+        await refresh_double_announcement_after_removal(
+            recording, recordings, "Usunięto jeden termin"
+        )
 
         details = []
         if not removed_message:
             details.append("nie udało się usunąć wiadomości z kanału")
-        if removed_threads < len(recording.get("forum_thread_ids", [])):
+        if (
+            not double_sibling_exists
+            and removed_threads < len(recording.get("forum_thread_ids", []))
+        ):
             details.append("nie udało się usunąć wszystkich postów nieobecności")
         warning = f"\n⚠️ {'; '.join(details)}." if details else ""
 
@@ -3616,98 +4446,59 @@ async def statusnagrywki(interaction: discord.Interaction):
         allowed_mentions=discord.AllowedMentions.none()
     )
 
-@bot.tree.command(
-    name="zakoncznagrywke",
-    description="Kończy aktywną nagrywkę"
-)
-async def zakoncznagrywke(
-    interaction: discord.Interaction,
-    recording_id: str = None
-):
+def recording_start_time(nagrywka):
+    start_time = datetime.fromisoformat(nagrywka["timestamp"])
+    if start_time.tzinfo is None:
+        start_time = start_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+    return start_time
 
-    if not any(
-        role.id in STAFF_ROLES
-        for role in interaction.user.roles
-    ):
-
-        await send_response(interaction,
-            "❌ Nie masz uprawnień.",
-            ephemeral=True
-        )
-
-        return
-
-
-    nagrywki = load_recordings()
-
-    if len(nagrywki) == 0:
-
-        await send_response(interaction,
-            "❌ Brak aktywnych nagrywek.",
-            ephemeral=True
-        )
-
-        return
-
-    if recording_id is None:
+async def finish_recording(interaction, message_id, nagrywka, nagrywki):
+    now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    try:
+        start_time = recording_start_time(nagrywka)
+    except (KeyError, TypeError, ValueError):
         await send_response(
             interaction,
-            "🎬 Wybierz nagrywkę do zakończenia:",
-            view=RecordingActionView("finish"),
+            "❌ Termin ma błędną datę rozpoczęcia. Nie został zakończony.",
             ephemeral=True
         )
-        return
+        return False
 
-    message_id = recording_id
-    nagrywka = nagrywki.get(message_id)
-    if nagrywka is None:
-        await send_response(interaction, "❌ Nie znaleziono nagrywki.", ephemeral=True)
-        return
-
-
-    channel = bot.get_channel(
-        NAGRYWKI_CHANNEL_ID
-    )
-
-
-    try:
-
-        message = await channel.fetch_message(
-            int(message_id)
+    if now < start_time:
+        await send_response(
+            interaction,
+            f"⛔ Tego terminu nie można jeszcze zakończyć. Rozpocznie się <t:{int(start_time.timestamp())}:R>.",
+            ephemeral=True
         )
+        return False
 
-        embed = discord.Embed(
-            title="✅ NAGRYWKA ZAKOŃCZONA",
-            color=discord.Color.green()
-        )
-
-        embed.add_field(
-            name="🎬 Nagrywka",
-            value=nagrywka["opis"],
-            inline=False
-        )
-
-        embed.add_field(
-            name="👤 Zakończył",
-            value=interaction.user.mention,
-            inline=False
-        )
-
-        await message.edit(
-            embed=embed,
-            view=None
-        )
-
-    except:
-        pass
+    # Zwykłą nagrywkę zamieniamy od razu w komunikat końcowy. W X2 jedna
+    # wiadomość obsługuje oba etapy, więc jej wygląd odświeża osobny helper.
+    if not nagrywka.get("double_group_id"):
+        channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+        try:
+            message = await channel.fetch_message(int(message_id))
+            embed = discord.Embed(
+                title="✅ NAGRYWKA ZAKOŃCZONA",
+                color=discord.Color.green()
+            )
+            embed.add_field(
+                name="🎬 Nagrywka",
+                value=nagrywka["opis"],
+                inline=False
+            )
+            embed.add_field(
+                name="👤 Zakończył",
+                value=interaction.user.mention,
+                inline=False
+            )
+            await message.edit(embed=embed, view=None)
+        except (AttributeError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
 
     guild = bot.get_guild(GUILD_ID)
     if guild is not None:
-        end_time = datetime.now(ZoneInfo("Europe/Warsaw"))
-        finalize_voice_sessions(
-            nagrywka,
-            end_time
-        )
+        finalize_voice_sessions(nagrywka, now)
         statistics = await build_recording_statistics(message_id, nagrywka, guild)
         await asyncio.to_thread(
             recording_stats_collection.update_one,
@@ -3716,24 +4507,151 @@ async def zakoncznagrywke(
             True
         )
         await send_recording_completion_report(
-            message_id,
-            nagrywka,
-            statistics,
-            end_time
+            message_id, nagrywka, statistics, now
         )
 
-    del nagrywki[message_id]
-
-    save_recordings(
-        nagrywki
-    )
+    del nagrywki[str(message_id)]
+    save_recordings(nagrywki)
     await asyncio.to_thread(refresh_recording_lock, nagrywki)
-
-
-    await send_response(interaction,
-        "✅ Nagrywka została zakończona.",
-        ephemeral=True
+    await refresh_double_announcement_after_removal(
+        nagrywka,
+        nagrywki,
+        f"Zakończono etap {nagrywka.get('double_position')}/2"
+        if nagrywka.get("double_position") else "Zakończono nagrywkę"
     )
+    return True
+
+@bot.tree.command(
+    name="zakonczetap",
+    description="Kończy pierwszy etap aktywnej podwójnej nagrywki"
+)
+async def zakonczetap(interaction: discord.Interaction):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    nagrywki = load_recordings()
+    first_stage = next(
+        (
+            (message_id, nagrywka)
+            for message_id, nagrywka in nagrywki.items()
+            if nagrywka.get("double_group_id")
+            and int(nagrywka.get("double_position", 0)) == 1
+        ),
+        None
+    )
+    if first_stage is None:
+        await send_response(
+            interaction,
+            "❌ `/zakonczetap` działa tylko podczas pierwszego etapu podwójnej nagrywki.",
+            ephemeral=True
+        )
+        return
+
+
+    message_id, nagrywka = first_stage
+    if await finish_recording(interaction, message_id, nagrywka, nagrywki):
+        await send_response(
+            interaction,
+            "✅ Etap **1/2** został zakończony. Raport 1/2 jest już na kanale raportów.",
+            ephemeral=True
+        )
+
+@bot.tree.command(
+    name="zakoncznagrywke",
+    description="Kończy aktywną nagrywkę albo drugi etap nagrywki X2"
+)
+async def zakoncznagrywke(
+    interaction: discord.Interaction,
+    recording_id: str = None
+):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    nagrywki = load_recordings()
+    if not nagrywki:
+        await send_response(interaction, "❌ Brak aktywnych nagrywek.", ephemeral=True)
+        return
+
+    double_recordings = [
+        (message_id, nagrywka)
+        for message_id, nagrywka in nagrywki.items()
+        if nagrywka.get("double_group_id")
+    ]
+    if recording_id is None and double_recordings:
+        first_active = any(
+            int(nagrywka.get("double_position", 0)) == 1
+            for _, nagrywka in double_recordings
+        )
+        if first_active:
+            await send_response(
+                interaction,
+                "⛔ Najpierw zakończ etap **1/2** komendą `/zakonczetap`.",
+                ephemeral=True
+            )
+            return
+        second_stage = next(
+            (
+                item for item in double_recordings
+                if int(item[1].get("double_position", 0)) == 2
+            ),
+            None
+        )
+        if second_stage:
+            recording_id = second_stage[0]
+
+    if recording_id is None:
+        if len(nagrywki) == 1:
+            recording_id = next(iter(nagrywki))
+        else:
+            await send_response(
+                interaction,
+                "🎬 Wybierz nagrywkę do zakończenia:",
+                view=RecordingActionView("finish"),
+                ephemeral=True
+            )
+            return
+
+    nagrywka = nagrywki.get(str(recording_id))
+    if nagrywka is None:
+        await send_response(interaction, "❌ Nie znaleziono nagrywki.", ephemeral=True)
+        return
+
+    if nagrywka.get("double_group_id"):
+        if int(nagrywka.get("double_position", 0)) == 1:
+            await send_response(
+                interaction,
+                "⛔ Pierwszy etap nagrywki X2 kończysz komendą `/zakonczetap`.",
+                ephemeral=True
+            )
+            return
+        first_stage_active = any(
+            item.get("double_group_id") == nagrywka.get("double_group_id")
+            and int(item.get("double_position", 0)) == 1
+            for item in nagrywki.values()
+        )
+        if first_stage_active:
+            await send_response(
+                interaction,
+                "⛔ Najpierw zakończ etap **1/2** komendą `/zakonczetap`.",
+                ephemeral=True
+            )
+            return
+
+    if await finish_recording(
+        interaction, str(recording_id), nagrywka, nagrywki
+    ):
+        success_text = (
+            "✅ Etap **2/2** został zakończony. Raport 2/2 jest już na kanale raportów."
+            if nagrywka.get("double_position") else
+            "✅ Nagrywka została zakończona. Raport jest już na kanale raportów."
+        )
+        await send_response(
+            interaction,
+            success_text,
+            ephemeral=True
+        )
 
 class PersonalStatsView(View):
     def __init__(self):
@@ -4078,6 +4996,7 @@ class DayMemberVoteSelect(Select):
         self.poll_id = poll["poll_id"]
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         poll = await asyncio.to_thread(
             day_member_polls_collection.find_one,
             {"poll_id": self.poll_id, "closed": False}
@@ -4259,6 +5178,7 @@ class DayMemberRecordingSelect(Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         document = self.documents.get(self.values[0])
         if not document:
             await send_response(interaction, "❌ Nie znaleziono nagrywki.", ephemeral=True)
@@ -4379,6 +5299,7 @@ class CloseDayMemberPollSelect(Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         if await close_day_member_poll(self.values[0], interaction.user):
             await send_response(interaction, "✅ Ankieta została zakończona, a wyniki opublikowane.", ephemeral=True)
         else:
