@@ -167,6 +167,7 @@ async def on_ready():
 
     await ensure_personal_stats_panel()
     await refresh_active_recording_messages()
+    await backfill_double_attendance_logs()
 
 # /ping
 @bot.tree.command(name="ping", description="Sprawdza opóźnienie bota")
@@ -1773,14 +1774,29 @@ async def save_double_attendance_choice(
             ),
             timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
         )
+        sorted_recordings = sorted(
+            refreshed,
+            key=lambda item: item.get("double_position", 0)
+        )
+        first_recording, second_recording = sorted_recordings
+        first_count = len(first_recording.get("uczestnicy", []))
+        second_count = len(second_recording.get("uczestnicy", []))
         log_embed.add_field(
-            name="📅 Start nagrywki X2",
-            value=f"**{refreshed[0]['data']} o {refreshed[0]['godzina']}**",
+            name=f"1️⃣ Etap 1/2 — {recording_display_name(first_recording)}",
+            value=(
+                f"👥 Zapisani: **{first_count} "
+                f"{polish_people_word(first_count)}**\n"
+                f"📅 {first_recording['data']} • 🕒 {first_recording['godzina']}"
+            ),
             inline=False
         )
         log_embed.add_field(
-            name="👥 Aktualna liczba zapisanych",
-            value=counts_text,
+            name=f"2️⃣ Etap 2/2 — {recording_display_name(second_recording)}",
+            value=(
+                f"👥 Zapisani: **{second_count} "
+                f"{polish_people_word(second_count)}**\n"
+                "▶️ Start po zakończeniu etapu 1/2"
+            ),
             inline=False
         )
         if late_reason:
@@ -1796,10 +1812,159 @@ async def save_double_attendance_choice(
                 embed=log_embed,
                 allowed_mentions=discord.AllowedMentions.none()
             )
+            await asyncio.to_thread(
+                recording_attendance_choices_collection.update_one,
+                {"group_id": group_id, "user_id": interaction.user.id},
+                {"$set": {
+                    "logged_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+                }}
+            )
         except (discord.Forbidden, discord.HTTPException):
             pass
 
     await update_double_lateness_report(group_id, refreshed)
+
+async def backfill_double_attendance_logs():
+    log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+    if log_channel is None:
+        try:
+            log_channel = await bot.fetch_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            print(f"❌ Nie znaleziono kanału nagrywki-logi: {NAGRYWKI_LOGS_CHANNEL_ID}")
+            return
+
+    # Najnowsze logi mogły zostać wysłane przez wersję sprzed dodania znacznika
+    # logged_at. Rozpoznaj je po stopce, aby nie dublować ich po wdrożeniu.
+    already_logged_user_ids = set()
+    try:
+        async for message in log_channel.history(limit=100):
+            if not message.embeds:
+                continue
+            embed = message.embeds[0]
+            if "nagrywka X2" not in (embed.title or ""):
+                continue
+            footer_text = embed.footer.text or ""
+            if "ID użytkownika:" not in footer_text:
+                continue
+            try:
+                already_logged_user_ids.add(
+                    int(footer_text.rsplit("ID użytkownika:", 1)[1].strip())
+                )
+            except ValueError:
+                continue
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    active_recordings = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({
+            "double_group_id": {"$exists": True}
+        }))
+    )
+    groups = {}
+    for recording in active_recordings:
+        groups.setdefault(recording["double_group_id"], []).append(recording)
+
+    restored_count = 0
+    for group_id, recordings in groups.items():
+        if len(recordings) != 2:
+            continue
+        recordings = sorted(
+            recordings,
+            key=lambda item: item.get("double_position", 0)
+        )
+        pending_choices = await asyncio.to_thread(
+            lambda current_group=group_id: list(
+                recording_attendance_choices_collection.find({
+                    "group_id": current_group,
+                    "logged_at": {"$exists": False}
+                })
+            )
+        )
+        for choice in pending_choices:
+            if int(choice["user_id"]) in already_logged_user_ids:
+                await asyncio.to_thread(
+                    recording_attendance_choices_collection.update_one,
+                    {"_id": choice["_id"]},
+                    {"$set": {
+                        "logged_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat(),
+                        "log_found_in_history": True
+                    }}
+                )
+                continue
+            selected_ids = {
+                int(value) for value in choice.get("recording_message_ids", [])
+            }
+            selected_names = [
+                recording_display_name(recording)
+                for recording in recordings
+                if int(recording["message_id"]) in selected_ids
+            ]
+            if not selected_names:
+                continue
+
+            status = choice.get("status", "present")
+            embed = discord.Embed(
+                title=(
+                    "♻️ Zaległy log spóźnienia — nagrywka X2"
+                    if status == "late" else
+                    "♻️ Zaległy log obecności — nagrywka X2"
+                ),
+                description=(
+                    f"<@{choice['user_id']}> wybrał(a): "
+                    f"**{' i '.join(selected_names)}**."
+                ),
+                color=(
+                    discord.Color.orange()
+                    if status == "late" else discord.Color.green()
+                ),
+                timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+            )
+            for recording in recordings:
+                count = len(recording.get("uczestnicy", []))
+                position = int(recording.get("double_position", 0))
+                timing = (
+                    f"📅 {recording['data']} • 🕒 {recording['godzina']}"
+                    if position == 1 else
+                    "▶️ Start po zakończeniu etapu 1/2"
+                )
+                embed.add_field(
+                    name=f"{position}️⃣ Etap {position}/2 — {recording_display_name(recording)}",
+                    value=(
+                        f"👥 Zapisani: **{count} {polish_people_word(count)}**\n"
+                        f"{timing}"
+                    ),
+                    inline=False
+                )
+            if choice.get("late_reason"):
+                embed.add_field(
+                    name="📝 Powód spóźnienia",
+                    value=str(choice["late_reason"])[:1024],
+                    inline=False
+                )
+            embed.set_footer(
+                text=f"Nadrobiony automatycznie • ID użytkownika: {choice['user_id']}"
+            )
+            try:
+                await log_channel.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się nadrobić logu X2 użytkownika {choice['user_id']}: {error}")
+                continue
+
+            await asyncio.to_thread(
+                recording_attendance_choices_collection.update_one,
+                {"_id": choice["_id"]},
+                {"$set": {
+                    "logged_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat(),
+                    "log_backfilled": True
+                }}
+            )
+            restored_count += 1
+
+    if restored_count:
+        print(f"✅ Nadrobiono zaległe logi zapisów X2: {restored_count}")
 
 class DoubleLateReasonModal(Modal, title="Powód spóźnienia"):
     reason = TextInput(
