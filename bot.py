@@ -887,11 +887,16 @@ async def on_raw_reaction_add(payload):
 
                 return
 
-            absence_authors = await collect_absence_authors(
+            absence_authors_by_forum = await collect_absence_authors(
                 nagrywka.get("forum_thread_ids", []),
                 nagrywka
             )
-            if payload.user_id in absence_authors:
+            absent_user_ids = {
+                user_id
+                for authors in absence_authors_by_forum.values()
+                for user_id in authors
+            }
+            if payload.user_id in absent_user_ids:
                 await message.remove_reaction("✅", member)
                 try:
                     await member.send(
@@ -2334,6 +2339,16 @@ async def refresh_active_recording_messages():
             try:
                 message = await channel.fetch_message(int(message_id))
 
+                absence_authors_by_forum = await collect_absence_authors(
+                    await find_recording_forum_threads(nagrywka),
+                    nagrywka
+                )
+                absent_user_ids = {
+                    user_id
+                    for authors in absence_authors_by_forum.values()
+                    for user_id in authors
+                }
+
                 # Reakcje na wiadomości są źródłem prawdy. Dzięki temu po restarcie
                 # odzyskamy również potwierdzenia kliknięte zanim zapis nagrywki
                 # zdążył trafić do bazy.
@@ -2346,6 +2361,12 @@ async def refresh_active_recording_messages():
                             continue
                         member = message.guild.get_member(user.id)
                         if member and any(role.id == URLOP_ROLE_ID for role in member.roles):
+                            continue
+                        if user.id in absent_user_ids:
+                            try:
+                                await message.remove_reaction("✅", user)
+                            except (discord.Forbidden, discord.HTTPException):
+                                pass
                             continue
                         confirmed_ids.append(user.id)
 
@@ -2494,6 +2515,15 @@ async def sync_recording_reactions():
         try:
             message = await channel.fetch_message(int(message_id))
             participant_ids = []
+            absence_authors_by_forum = await collect_absence_authors(
+                await find_recording_forum_threads(nagrywka),
+                nagrywka
+            )
+            absent_user_ids = {
+                user_id
+                for authors in absence_authors_by_forum.values()
+                for user_id in authors
+            }
 
             for reaction in message.reactions:
                 if str(reaction.emoji) != "✅":
@@ -2505,6 +2535,12 @@ async def sync_recording_reactions():
 
                     member = message.guild.get_member(reacting_user.id)
                     if member and any(role.id == URLOP_ROLE_ID for role in member.roles):
+                        continue
+                    if reacting_user.id in absent_user_ids:
+                        try:
+                            await message.remove_reaction("✅", reacting_user)
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
                         continue
 
                     participant_ids.append(reacting_user.id)
@@ -2579,16 +2615,19 @@ async def collect_absence_authors(thread_ids, nagrywka=None):
 
 async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
     selected_ids = {int(value) for value in selected_ids}
-    await asyncio.to_thread(
-        recordings_collection.update_many,
-        {
-            "double_group_id": group_id,
-            "message_id": {"$in": list(selected_ids)}
-        },
-        {"$pull": {
-            "uczestnicy": {"$in": [int(user_id), str(user_id)]}
-        }}
+    group_recordings = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": group_id}))
     )
+    for group_recording in group_recordings:
+        if int(group_recording.get("message_id", 0)) not in selected_ids:
+            continue
+        await asyncio.to_thread(
+            recordings_collection.update_one,
+            {"_id": group_recording["_id"]},
+            {"$pull": {
+                "uczestnicy": {"$in": [int(user_id), str(user_id)]}
+            }}
+        )
 
     attendance_choice = await asyncio.to_thread(
         recording_attendance_choices_collection.find_one,
