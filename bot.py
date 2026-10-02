@@ -38,6 +38,7 @@ recording_locks_collection = db["recording_locks"]
 recording_absences_collection = db["recording_absences"]
 recording_attendance_choices_collection = db["recording_attendance_choices"]
 recording_lateness_reports_collection = db["recording_lateness_reports"]
+bot_state_collection = db["bot_state"]
 
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -414,6 +415,7 @@ STAFF_ROLES = [
 
 STATUS_CHANNEL_ID = 1513930933525413959
 STATUS_MESSAGE_ID = None
+STATUS_PANEL_STATE_ID = "kaciej_arcade_status_panel"
 
 class TicketModal(Modal, title="Nowe zgłoszenie"):
 
@@ -667,68 +669,110 @@ async def update_server_status():
                 player_value = f"**{player_count} graczy**"
 
             embed = discord.Embed(
-                title="🎮 KACIEJ ARCADE",
+                title="🕹️ Kaciej Arcade • Status serwera",
                 description=(
-                    "### 🟢 SERWER ONLINE\n"
-                    "Serwer działa prawidłowo i jest gotowy do gry."
+                    "## 🟢 ONLINE\n"
+                    "Serwer jest dostępny i czeka na graczy."
                 ),
-                color=discord.Color.green(),
+                color=0x57F287,
                 timestamp=now
             )
-            embed.add_field(name="👥 Gracze online", value=player_value, inline=False)
+            embed.add_field(name="👥 Gracze", value=player_value, inline=False)
+            embed.add_field(name="⚡ Dostępność", value="**Serwer działa prawidłowo**", inline=False)
             embed.add_field(
-                name="🚀 Jak dołączyć?",
-                value="Skopiuj i wklej w konsoli **F8**:\n```connect kaciejarcade.tknagrywki.pl```",
+                name="🚀 Dołącz do serwera",
+                value=(
+                    "Otwórz konsolę **F8** i wklej:\n"
+                    "```connect kaciejarcade.tknagrywki.pl```"
+                ),
                 inline=False
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as error:
             print(f"❌ Kaciej Arcade status error: {error}")
             embed = discord.Embed(
-                title="🎮 KACIEJ ARCADE",
+                title="🕹️ Kaciej Arcade • Status serwera",
                 description=(
-                    "### 🔴 SERWER OFFLINE\n"
-                    "Serwer jest obecnie niedostępny albo nie odpowiada. Spróbuj ponownie później."
+                    "## 🔴 OFFLINE\n"
+                    "Serwer chwilowo nie odpowiada. Panel sprawdzi go ponownie automatycznie."
                 ),
-                color=discord.Color.red(),
+                color=0xED4245,
                 timestamp=now
             )
-            embed.add_field(name="🔧 Status", value="**Brak połączenia**", inline=True)
+            embed.add_field(name="🛠️ Stan", value="**Brak połączenia z serwerem**", inline=False)
+            embed.add_field(
+                name="🔄 Co dalej?",
+                value="Nie musisz nic robić — status odświeża się automatycznie co 3 minuty.",
+                inline=False
+            )
 
     if bot.user:
         embed.set_thumbnail(url=bot.user.display_avatar.url)
     embed.set_footer(
         text=(
-            "Kaciej Arcade • Automatyczna aktualizacja co 3 minuty • "
+            "Kaciej Arcade • Panel statusu • Aktualizacja co 3 minuty • "
             f"{now.strftime('%d.%m.%Y, %H:%M:%S')}"
         )
     )
 
     global STATUS_MESSAGE_ID
-    try:
-        message = None
-        if STATUS_MESSAGE_ID:
+    message = None
+
+    if STATUS_MESSAGE_ID is None:
+        saved_panel = await asyncio.to_thread(
+            bot_state_collection.find_one,
+            {"_id": STATUS_PANEL_STATE_ID}
+        )
+        if saved_panel and saved_panel.get("message_id"):
+            STATUS_MESSAGE_ID = int(saved_panel["message_id"])
+
+    if STATUS_MESSAGE_ID:
+        try:
             message = await channel.fetch_message(STATUS_MESSAGE_ID)
-        else:
-            async for previous_message in channel.history(limit=25):
+        except discord.NotFound:
+            STATUS_MESSAGE_ID = None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Nie udało się pobrać panelu statusu: {error}")
+            return
+
+    if message is None:
+        known_titles = {
+            "🕹️ Kaciej Arcade • Status serwera",
+            "🎮 KACIEJ ARCADE",
+            "🎮 STATUS SERWERÓW KACIEJOS"
+        }
+        try:
+            async for previous_message in channel.history(limit=None):
                 if (
                     previous_message.author == bot.user
                     and previous_message.embeds
-                    and previous_message.embeds[0].title in (
-                        "🎮 KACIEJ ARCADE",
-                        "🎮 STATUS SERWERÓW KACIEJOS"
-                    )
+                    and previous_message.embeds[0].title in known_titles
                 ):
                     message = previous_message
                     break
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Nie udało się odnaleźć starego panelu statusu: {error}")
+            return
 
-        if message:
-            await message.edit(embed=embed)
-        else:
+    try:
+        if message is None:
             message = await channel.send(embed=embed)
-        STATUS_MESSAGE_ID = message.id
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        message = await channel.send(embed=embed)
-        STATUS_MESSAGE_ID = message.id
+        else:
+            await message.edit(embed=embed)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"❌ Nie udało się zaktualizować panelu statusu: {error}")
+        return
+
+    STATUS_MESSAGE_ID = message.id
+    await asyncio.to_thread(
+        bot_state_collection.update_one,
+        {"_id": STATUS_PANEL_STATE_ID},
+        {"$set": {
+            "channel_id": channel.id,
+            "message_id": message.id,
+            "updated_at": now.isoformat()
+        }},
+        upsert=True
+    )
 
 @update_server_status.before_loop
 async def before_update_server_status():
