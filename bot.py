@@ -1953,14 +1953,14 @@ async def save_double_attendance_choice(
 
     await update_double_lateness_report(group_id, refreshed)
 
-async def backfill_double_attendance_logs():
+async def backfill_double_attendance_logs(force_group_id=None):
     log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
     if log_channel is None:
         try:
             log_channel = await bot.fetch_channel(NAGRYWKI_LOGS_CHANNEL_ID)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             print(f"❌ Nie znaleziono kanału nagrywki-logi: {NAGRYWKI_LOGS_CHANNEL_ID}")
-            return
+            return 0
 
     # Zachowujemy treść istniejących logów. Samo ID użytkownika nie wystarcza,
     # bo ta sama osoba może mieć logi z wielu różnych nagrywek X2.
@@ -2016,7 +2016,7 @@ async def backfill_double_attendance_logs():
                 )
                 for old_embed in historical_log_embeds
             )
-            if log_already_exists:
+            if log_already_exists and group_id != force_group_id:
                 await asyncio.to_thread(
                     recording_attendance_choices_collection.update_one,
                     {"_id": choice["_id"]},
@@ -2103,6 +2103,7 @@ async def backfill_double_attendance_logs():
 
     if restored_count:
         print(f"✅ Nadrobiono zaległe logi zapisów X2: {restored_count}")
+    return restored_count
 
 class DoubleLateReasonModal(Modal, title="Powód spóźnienia"):
     reason = TextInput(
@@ -2682,8 +2683,10 @@ async def synchronize_double_group_attendance(group_id):
         }))
     )
 
+    count_changes = []
     for group_recording in group_recordings:
         recording_id = int(group_recording.get("message_id", 0))
+        before_count = len(group_recording.get("uczestnicy", []))
         absent_user_ids = {
             int(absence["user_id"])
             for absence in absences
@@ -2704,15 +2707,21 @@ async def synchronize_double_group_attendance(group_id):
             {"_id": group_recording["_id"]},
             {"$set": {"uczestnicy": participant_ids}}
         )
+        count_changes.append({
+            "position": int(group_recording.get("double_position", 0)),
+            "before": before_count,
+            "after": len(participant_ids),
+            "recording_id": recording_id
+        })
 
     refreshed = await asyncio.to_thread(
         lambda: list(recordings_collection.find({"double_group_id": group_id}))
     )
     if not refreshed:
-        return
+        return count_changes
     channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
     if channel is None:
-        return
+        return count_changes
     try:
         announcement = await channel.fetch_message(
             int(refreshed[0]["announcement_message_id"])
@@ -2723,6 +2732,14 @@ async def synchronize_double_group_attendance(group_id):
         )
     except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
         print(f"❌ Nie udało się odświeżyć licznika X2 dla {group_id}: {error}")
+    print(
+        f"✅ Przeliczono zapisy X2 {group_id}: "
+        + ", ".join(
+            f"{change['position']}/2 {change['before']}→{change['after']}"
+            for change in sorted(count_changes, key=lambda item: item["position"])
+        )
+    )
+    return count_changes
 
 
 async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
@@ -5340,6 +5357,54 @@ async def cofnijnieobecnosc(
         view=WithdrawAbsenceView(recordings, user, powod),
         ephemeral=True
     )
+
+@bot.tree.command(
+    name="naprawx2",
+    description="Wymusza przeliczenie zapisów i odzyskanie logów aktywnej nagrywki X2"
+)
+async def naprawx2(interaction: discord.Interaction):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    active_double_recordings = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({
+            "double_group_id": {"$exists": True}
+        }))
+    )
+    group_ids = list(dict.fromkeys(
+        recording["double_group_id"] for recording in active_double_recordings
+    ))
+    if not group_ids:
+        await send_response(
+            interaction,
+            "❌ Nie ma aktywnej podwójnej nagrywki.",
+            ephemeral=True
+        )
+        return
+
+    await reconcile_existing_double_absences()
+    result_lines = []
+    total_restored_logs = 0
+    for group_id in group_ids:
+        changes = await synchronize_double_group_attendance(group_id)
+        total_restored_logs += await backfill_double_attendance_logs(
+            force_group_id=group_id
+        )
+        readable_changes = ", ".join(
+            f"etap {change['position']}/2: **{change['before']} → {change['after']}**"
+            for change in sorted(changes, key=lambda item: item["position"])
+        )
+        result_lines.append(f"• {readable_changes}")
+
+    await send_response(
+        interaction,
+        "✅ **Naprawa X2 zakończona.**\n"
+        + "\n".join(result_lines)
+        + f"\n♻️ Odzyskane logi: **{total_restored_logs}**",
+        ephemeral=True
+    )
+
 
 @bot.tree.command(
     name="statusnagrywki",
