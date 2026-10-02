@@ -887,6 +887,22 @@ async def on_raw_reaction_add(payload):
 
                 return
 
+            absence_authors = await collect_absence_authors(
+                nagrywka.get("forum_thread_ids", []),
+                nagrywka
+            )
+            if payload.user_id in absence_authors:
+                await message.remove_reaction("✅", member)
+                try:
+                    await member.send(
+                        "❌ Masz zapisaną nieobecność na tę nagrywkę. "
+                        "Poproś administrację o użycie `/cofnijnieobecnosc`, "
+                        "zanim ponownie potwierdzisz obecność."
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+                return
+
             if payload.user_id not in nagrywka["uczestnicy"]:
 
                 nagrywka["uczestnicy"].append(
@@ -1409,8 +1425,9 @@ def double_recording_forum_content(recordings):
         "### Jak zgłosić nieobecność?\n"
         "**1.** Wybierz z listy etap 1/2, etap 2/2 albo oba.\n"
         "**2.** Napisz poniżej powód nieobecności.\n\n"
-        "✅ Dopiero po wysłaniu powodu bot zapisze nieobecność i automatycznie usunie "
-        "Twoje potwierdzenie obecności z wybranych etapów."
+        "🔒 Po wysłaniu powodu nieobecność zostanie zapisana, a bot usunie Twoje "
+        "potwierdzenie z wybranych etapów. Ponowny zapis będzie możliwy dopiero po "
+        "cofnięciu nieobecności przez administrację."
     )
 
 class DoubleAbsenceSelect(Select):
@@ -1454,6 +1471,25 @@ class DoubleAbsenceSelect(Select):
             )
             return
 
+        existing_absence = await asyncio.to_thread(
+            recording_absences_collection.find_one,
+            {
+                "group_id": self.group_id,
+                "user_id": interaction.user.id,
+                "forum_id": interaction.channel.parent_id,
+                "confirmed": True
+            }
+        )
+        if existing_absence is not None:
+            await interaction.edit_original_response(
+                content=(
+                    "❌ Masz już zapisaną nieobecność dla tej nagrywki. "
+                    "Jeżeli chcesz ją zmienić lub wrócić na listę obecnych, "
+                    "administracja musi najpierw użyć `/cofnijnieobecnosc`."
+                )
+            )
+            return
+
         selected_ids = (
             [int(recording["message_id"]) for recording in self.recordings]
             if self.values[0] == "both"
@@ -1470,6 +1506,7 @@ class DoubleAbsenceSelect(Select):
             {"$set": {
                 "recording_message_ids": selected_ids,
                 "confirmed": False,
+                "status": "awaiting_reason",
                 "reason_message_id": None,
                 "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
             }},
@@ -1483,8 +1520,8 @@ class DoubleAbsenceSelect(Select):
         await interaction.edit_original_response(
             content=(
                 "📝 Wybrano: **" + " i ".join(selected_names) + "**.\n"
-                "Teraz napisz w tym poście **powód nieobecności**. Dopiero po wysłaniu "
-                "wiadomości nieobecność zostanie zapisana, a Twój zapis usunięty."
+                "Teraz napisz w tym poście **powód nieobecności**. Po jego wysłaniu "
+                "nieobecność zostanie zapisana i zablokuje ponowny zapis."
             )
         )
 
@@ -1718,9 +1755,9 @@ async def save_double_attendance_choice(
         ]
         await interaction.edit_original_response(
             content=(
-                "❌ Masz już zatwierdzoną nieobecność na: **"
+                "❌ Masz już zapisaną nieobecność na: **"
                 + " i ".join(conflicting_names)
-                + "**. Najpierw administracja musi ją odrzucić lub usunąć."
+                + "**. Administracja musi najpierw użyć `/cofnijnieobecnosc`."
             )
         )
         return
@@ -2635,6 +2672,19 @@ async def enforce_double_absence_selection(message):
             pass
         return
 
+
+    if selection.get("confirmed"):
+        try:
+            await message.delete()
+            await message.author.send(
+                "❌ Masz już zapisaną nieobecność na tę podwójną nagrywkę. "
+                "Jej zmianę musi najpierw odblokować administracja komendą "
+                "`/cofnijnieobecnosc`."
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return
+
     selected_ids = [
         int(value) for value in selection.get("recording_message_ids", [])
     ]
@@ -2643,20 +2693,22 @@ async def enforce_double_absence_selection(message):
         {"_id": selection["_id"]},
         {"$set": {
             "confirmed": True,
+            "status": "confirmed",
             "reason_message_id": message.id,
             "reason_preview": message.content[:500],
             "submitted_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
         }}
     )
+    try:
+        await message.add_reaction("✅")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
     await remove_double_absence_from_signups(
         recording["double_group_id"],
         message.author.id,
         selected_ids
     )
-    try:
-        await message.add_reaction("✅")
-    except (discord.Forbidden, discord.HTTPException):
-        pass
 
 async def reconcile_existing_double_absences():
     selections = await asyncio.to_thread(
@@ -2673,6 +2725,10 @@ async def reconcile_existing_double_absences():
             )
         )
         if not recordings:
+            continue
+
+        # Sam wybór bez napisania powodu nie jest jeszcze nieobecnością.
+        if selection.get("status") == "awaiting_reason":
             continue
 
         has_reason = bool(selection.get("confirmed"))
@@ -2706,6 +2762,7 @@ async def reconcile_existing_double_absences():
             {"_id": selection["_id"]},
             {"$set": {
                 "confirmed": True,
+                "status": "approved_legacy",
                 "reason_message_id": reason_message_id,
                 "reconciled_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
             }}
@@ -4982,13 +5039,13 @@ async def usunobecnosc(
 
     await send_response(interaction, result, ephemeral=True)
 
-class RejectAbsenceSelect(Select):
+class WithdrawAbsenceSelect(Select):
     def __init__(self, recordings, target_user, reason):
         self.recordings = recordings
         self.target_user = target_user
         self.reason = reason
         super().__init__(
-            placeholder="Wybierz nagrywkę, której nieobecność odrzucasz...",
+            placeholder="Wybierz nagrywkę, z której cofasz nieobecność...",
             min_values=1,
             max_values=1,
             options=recording_select_options(recordings)
@@ -5059,7 +5116,7 @@ class RejectAbsenceSelect(Select):
                     if message.author.id != self.target_user.id:
                         continue
                     await message.delete(
-                        reason=f"Nieobecność odrzucona przez {interaction.user}"
+                        reason=f"Nieobecność cofnięta przez {interaction.user}"
                     )
                     deleted_messages += 1
                     absence_removed = True
@@ -5083,12 +5140,12 @@ class RejectAbsenceSelect(Select):
         dm_sent = True
         try:
             await self.target_user.send(
-                "❌ **Twoja nieobecność została odrzucona.**\n\n"
+                "↩️ **Twoja nieobecność została cofnięta.**\n\n"
                 f"🎬 **{recording_display_name(recording)}**\n"
                 f"📅 {recording['data']} • 🕒 {recording['godzina']}\n"
                 f"📝 Powód: **{self.reason}**\n"
                 f"🔗 Nagrywka: {announcement_url}\n\n"
-                "Musisz ponownie określić swoją obecność na tę nagrywkę."
+                "Możesz teraz ponownie określić swoją obecność na tę nagrywkę."
             )
         except (discord.Forbidden, discord.HTTPException):
             dm_sent = False
@@ -5096,13 +5153,13 @@ class RejectAbsenceSelect(Select):
         log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
         if log_channel is not None:
             log_embed = discord.Embed(
-                title="❌ Odrzucono nieobecność",
+                title="↩️ Cofnięto nieobecność",
                 description=f"**{recording_display_name(recording)}**",
                 color=discord.Color.red(),
                 timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
             )
             log_embed.add_field(name="👤 Osoba", value=self.target_user.mention, inline=True)
-            log_embed.add_field(name="🛡️ Odrzucił", value=interaction.user.mention, inline=True)
+            log_embed.add_field(name="🛡️ Cofnął", value=interaction.user.mention, inline=True)
             log_embed.add_field(
                 name="📅 Termin",
                 value=f"{recording['data']} • {recording['godzina']}",
@@ -5121,30 +5178,30 @@ class RejectAbsenceSelect(Select):
 
         await interaction.edit_original_response(
             content=(
-                f"✅ Odrzucono nieobecność {self.target_user.mention} dla "
+                f"✅ Cofnięto nieobecność {self.target_user.mention} dla "
                 f"**{recording_display_name(recording)}**."
                 + ("" if dm_sent else " ⚠️ Nie udało się wysłać wiadomości prywatnej.")
             ),
             view=None
         )
 
-class RejectAbsenceView(View):
+class WithdrawAbsenceView(View):
     def __init__(self, recordings, target_user, reason):
         super().__init__(timeout=120)
-        self.add_item(RejectAbsenceSelect(recordings, target_user, reason))
+        self.add_item(WithdrawAbsenceSelect(recordings, target_user, reason))
 
 @bot.tree.command(
-    name="odrzucnieobecnosc",
-    description="Odrzuca zgłoszoną nieobecność i wysyła osobie powód"
+    name="cofnijnieobecnosc",
+    description="Cofa nieobecność i ponownie pozwala osobie zapisać się na nagrywkę"
 )
 @app_commands.describe(
-    user="Osoba, której nieobecność odrzucasz",
-    powod="Powód odrzucenia nieobecności"
+    user="Osoba, której nieobecność cofasz",
+    powod="Opcjonalny powód cofnięcia nieobecności"
 )
-async def odrzucnieobecnosc(
+async def cofnijnieobecnosc(
     interaction: discord.Interaction,
     user: discord.Member,
-    powod: str
+    powod: str = "Decyzja administracji"
 ):
     if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
         await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
@@ -5157,8 +5214,8 @@ async def odrzucnieobecnosc(
 
     await send_response(
         interaction,
-        f"🎬 Wybierz nagrywkę, dla której odrzucasz nieobecność {user.mention}:",
-        view=RejectAbsenceView(recordings, user, powod),
+        f"🎬 Wybierz nagrywkę, dla której cofasz nieobecność {user.mention}:",
+        view=WithdrawAbsenceView(recordings, user, powod),
         ephemeral=True
     )
 
