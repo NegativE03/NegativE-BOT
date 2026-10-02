@@ -2810,10 +2810,6 @@ async def reconcile_existing_double_absences():
         if not recordings:
             continue
 
-        # Sam wybór bez napisania powodu nie jest jeszcze nieobecnością.
-        if selection.get("status") == "awaiting_reason":
-            continue
-
         has_reason = bool(selection.get("confirmed"))
         reason_message_id = selection.get("reason_message_id")
         if not has_reason:
@@ -2823,6 +2819,10 @@ async def reconcile_existing_double_absences():
                 for recording in recordings
                 for thread_id in recording.get("forum_thread_ids", [])
             }
+            if not thread_ids:
+                thread_ids.update(
+                    await find_recording_forum_threads(recordings[0])
+                )
             for thread_id in thread_ids:
                 try:
                     thread = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
@@ -2854,6 +2854,11 @@ async def reconcile_existing_double_absences():
             group_id,
             int(selection["user_id"]),
             selection.get("recording_message_ids", [])
+        )
+        print(
+            "✅ Nieobecność X2 zsynchronizowana: "
+            f"user={selection['user_id']}, "
+            f"nagrywki={selection.get('recording_message_ids', [])}"
         )
         reconciled += 1
 
