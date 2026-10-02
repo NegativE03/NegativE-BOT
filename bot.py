@@ -416,6 +416,7 @@ STAFF_ROLES = [
 STATUS_CHANNEL_ID = 1513930933525413959
 STATUS_MESSAGE_ID = None
 STATUS_PANEL_STATE_ID = "kaciej_arcade_status_panel"
+BOT_REMOVING_ABSENCE_MESSAGE_IDS = set()
 
 class TicketModal(Modal, title="Nowe zgłoszenie"):
 
@@ -808,6 +809,92 @@ async def on_message_delete(message):
     if message.author.bot:
         return
 
+    if message.id in BOT_REMOVING_ABSENCE_MESSAGE_IDS:
+        BOT_REMOVING_ABSENCE_MESSAGE_IDS.discard(message.id)
+        return
+
+    if isinstance(message.channel, discord.Thread):
+        recording = await asyncio.to_thread(
+            recordings_collection.find_one,
+            {"forum_thread_ids": message.channel.id}
+        )
+        if recording is not None:
+            absence_was_active = True
+            if recording.get("double_group_id"):
+                selection = await asyncio.to_thread(
+                    recording_absences_collection.find_one_and_delete,
+                    {
+                        "group_id": recording["double_group_id"],
+                        "user_id": message.author.id,
+                        "forum_id": message.channel.parent_id,
+                        "reason_message_id": message.id,
+                        "confirmed": True
+                    }
+                )
+                absence_was_active = selection is not None
+                if selection is not None:
+                    await synchronize_double_group_attendance(
+                        recording["double_group_id"]
+                    )
+
+            if absence_was_active:
+                absence_log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+                if absence_log_channel is None:
+                    try:
+                        absence_log_channel = await bot.fetch_channel(
+                            NAGRYWKI_LOGS_CHANNEL_ID
+                        )
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        absence_log_channel = None
+
+                if absence_log_channel is not None:
+                    announcement_id = int(recording.get(
+                        "announcement_message_id", recording["message_id"]
+                    ))
+                    announcement_url = (
+                        f"https://discord.com/channels/{GUILD_ID}/"
+                        f"{NAGRYWKI_CHANNEL_ID}/{announcement_id}"
+                    )
+                    absence_embed = discord.Embed(
+                        title="↩️ Użytkownik cofnął swoją nieobecność",
+                        description=(
+                            f"{message.author.mention} samodzielnie usunął wiadomość "
+                            "ze zgłoszeniem nieobecności."
+                        ),
+                        color=discord.Color.orange(),
+                        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+                    )
+                    absence_embed.add_field(
+                        name="🎬 Nagrywka",
+                        value=(
+                            f"**{recording_display_name(recording)}**"
+                            + (
+                                f" • etap **{recording.get('double_position')}/2**"
+                                if recording.get("double_group_id") else ""
+                            )
+                        ),
+                        inline=False
+                    )
+                    absence_embed.add_field(
+                        name="📅 Termin",
+                        value=f"{recording['data']} • {recording['godzina']}",
+                        inline=True
+                    )
+                    absence_embed.add_field(
+                        name="🔗 Nagrywka",
+                        value=f"[Przejdź do wiadomości]({announcement_url})",
+                        inline=False
+                    )
+                    absence_embed.set_thumbnail(url=message.author.display_avatar.url)
+                    absence_embed.set_footer(text=f"ID użytkownika: {message.author.id}")
+                    try:
+                        await absence_log_channel.send(
+                            embed=absence_embed,
+                            allowed_mentions=discord.AllowedMentions.none()
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as error:
+                        print(f"❌ Nie udało się wysłać logu samodzielnie cofniętej nieobecności: {error}")
+
     log_channel = bot.get_channel(MESSAGE_LOGS_CHANNEL_ID)
 
     if not log_channel:
@@ -837,6 +924,80 @@ async def on_message_delete(message):
     )
 
     await log_channel.send(embed=embed)
+
+
+@bot.event
+async def on_raw_message_delete(payload):
+    """Obsługuje stare, niebuforowane wiadomości nieobecności X2."""
+    selection = await asyncio.to_thread(
+        recording_absences_collection.find_one_and_delete,
+        {"reason_message_id": payload.message_id, "confirmed": True}
+    )
+    if selection is None:
+        return
+
+    recordings = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({
+            "double_group_id": selection["group_id"]
+        }))
+    )
+    if not recordings:
+        return
+
+    await synchronize_double_group_attendance(selection["group_id"])
+    selected_ids = {
+        int(value) for value in selection.get("recording_message_ids", [])
+    }
+    selected_recordings = [
+        recording for recording in recordings
+        if int(recording["message_id"]) in selected_ids
+    ]
+    selected_names = ", ".join(
+        f"{recording_display_name(recording)} ({recording.get('double_position')}/2)"
+        for recording in selected_recordings
+    ) or "Nagrywka X2"
+
+    log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+    if log_channel is None:
+        try:
+            log_channel = await bot.fetch_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    first_recording = recordings[0]
+    announcement_id = int(first_recording["announcement_message_id"])
+    announcement_url = (
+        f"https://discord.com/channels/{GUILD_ID}/"
+        f"{NAGRYWKI_CHANNEL_ID}/{announcement_id}"
+    )
+    embed = discord.Embed(
+        title="↩️ Użytkownik cofnął swoją nieobecność",
+        description=(
+            f"<@{selection['user_id']}> samodzielnie usunął wiadomość "
+            "ze zgłoszeniem nieobecności."
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    embed.add_field(name="🎬 Nagrywka", value=f"**{selected_names}**", inline=False)
+    embed.add_field(
+        name="📅 Termin",
+        value=f"{first_recording['data']} • {first_recording['godzina']}",
+        inline=True
+    )
+    embed.add_field(
+        name="🔗 Nagrywka",
+        value=f"[Przejdź do wiadomości]({announcement_url})",
+        inline=False
+    )
+    embed.set_footer(text=f"ID użytkownika: {selection['user_id']}")
+    try:
+        await log_channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"❌ Nie udało się wysłać logu usuniętej nieobecności X2: {error}")
 
 @bot.event
 async def on_message_edit(before, after):
@@ -4352,16 +4513,32 @@ class RecordingActionSelect(Select):
         recording_id = self.values[0]
         if self.action != "edit":
             await interaction.response.defer(ephemeral=True, thinking=True)
-        if self.action == "remind":
-            await przypomnijnagrywke.callback(interaction, recording_id)
-        elif self.action == "remove":
-            await usunobecnosc.callback(interaction, self.target_user, recording_id)
-        elif self.action == "finish":
-            await zakoncznagrywke.callback(interaction, recording_id)
-        elif self.action == "edit":
-            nagrywka = load_recordings().get(recording_id)
-            if nagrywka:
-                await interaction.response.send_modal(EditRecordingModal(recording_id, nagrywka))
+        try:
+            if self.action == "remind":
+                await przypomnijnagrywke.callback(interaction, recording_id)
+            elif self.action == "remove":
+                await usunobecnosc.callback(interaction, self.target_user, recording_id)
+            elif self.action == "finish":
+                await zakoncznagrywke.callback(interaction, recording_id)
+            elif self.action == "edit":
+                nagrywka = load_recordings().get(recording_id)
+                if nagrywka:
+                    await interaction.response.send_modal(EditRecordingModal(recording_id, nagrywka))
+        except Exception as error:
+            print(
+                f"❌ Błąd akcji {self.action} dla nagrywki {recording_id}: "
+                f"{type(error).__name__}: {error}"
+            )
+            if interaction.response.is_done():
+                await interaction.edit_original_response(
+                    content="❌ Nie udało się wykonać tej operacji. Szczegóły zapisano w logach.",
+                    view=None
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Nie udało się wykonać tej operacji. Szczegóły zapisano w logach.",
+                    ephemeral=True
+                )
 
 class RecordingActionView(View):
     def __init__(self, action, user=None):
@@ -5134,6 +5311,69 @@ async def usunobecnosc(
         await send_response(interaction, "❌ Nie znaleziono nagrywki.", ephemeral=True)
         return
 
+    if nagrywka.get("double_group_id"):
+        choice = await asyncio.to_thread(
+            recording_attendance_choices_collection.find_one,
+            {
+                "group_id": nagrywka["double_group_id"],
+                "user_id": user.id,
+                "recording_message_ids": int(message_id)
+            }
+        )
+        if choice is None:
+            await interaction.edit_original_response(
+                content=(
+                    f"❌ {user.mention} nie ma potwierdzonej obecności na "
+                    f"**{recording_display_name(nagrywka)}**."
+                ),
+                view=None
+            )
+            return
+
+        remaining_ids = [
+            int(value)
+            for value in choice.get("recording_message_ids", [])
+            if int(value) != int(message_id)
+        ]
+        if remaining_ids:
+            await asyncio.to_thread(
+                recording_attendance_choices_collection.update_one,
+                {"_id": choice["_id"]},
+                {"$set": {
+                    "recording_message_ids": remaining_ids,
+                    "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+                }}
+            )
+        else:
+            await asyncio.to_thread(
+                recording_attendance_choices_collection.delete_one,
+                {"_id": choice["_id"]}
+            )
+
+        changes = await synchronize_double_group_attendance(
+            nagrywka["double_group_id"]
+        )
+        change = next(
+            (
+                item for item in changes
+                if int(item["recording_id"]) == int(message_id)
+            ),
+            None
+        )
+        count_text = (
+            f" Licznik: **{change['before']} → {change['after']}**."
+            if change else ""
+        )
+        await interaction.edit_original_response(
+            content=(
+                f"✅ Usunięto obecność {user.mention} z "
+                f"**{recording_display_name(nagrywka)}** "
+                f"(etap {nagrywka.get('double_position')}/2).{count_text}"
+            ),
+            view=None
+        )
+        return
+
     if user.id not in nagrywka.get("uczestnicy", []):
         await send_response(
             interaction,
@@ -5143,7 +5383,7 @@ async def usunobecnosc(
         return
 
     nagrywka["uczestnicy"].remove(user.id)
-    save_recordings(nagrywki)
+    await asyncio.to_thread(save_recordings, nagrywki)
 
     channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
     reaction_removed = False
@@ -5254,6 +5494,7 @@ class WithdrawAbsenceSelect(Select):
                 async for message in thread.history(limit=None):
                     if message.author.id != self.target_user.id:
                         continue
+                    BOT_REMOVING_ABSENCE_MESSAGE_IDS.add(message.id)
                     await message.delete(
                         reason=f"Nieobecność cofnięta przez {interaction.user}"
                     )
@@ -5289,16 +5530,37 @@ class WithdrawAbsenceSelect(Select):
         except (discord.Forbidden, discord.HTTPException):
             dm_sent = False
 
+        log_sent = False
         log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+        if log_channel is None:
+            try:
+                log_channel = await bot.fetch_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie znaleziono kanału logów cofniętych nieobecności: {error}")
+
         if log_channel is not None:
             log_embed = discord.Embed(
                 title="↩️ Cofnięto nieobecność",
-                description=f"**{recording_display_name(recording)}**",
-                color=discord.Color.red(),
+                description=(
+                    f"Nieobecność {self.target_user.mention} została cofnięta.\n"
+                    "Osoba może ponownie zapisać się na wskazaną nagrywkę."
+                ),
+                color=discord.Color.orange(),
                 timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
             )
             log_embed.add_field(name="👤 Osoba", value=self.target_user.mention, inline=True)
             log_embed.add_field(name="🛡️ Cofnął", value=interaction.user.mention, inline=True)
+            log_embed.add_field(
+                name="🎬 Nagrywka",
+                value=(
+                    f"**{recording_display_name(recording)}**"
+                    + (
+                        f" • etap **{recording.get('double_position')}/2**"
+                        if recording.get("double_group_id") else ""
+                    )
+                ),
+                inline=False
+            )
             log_embed.add_field(
                 name="📅 Termin",
                 value=f"{recording['data']} • {recording['godzina']}",
@@ -5310,16 +5572,28 @@ class WithdrawAbsenceSelect(Select):
                 value=f"[Przejdź do wiadomości]({announcement_url})",
                 inline=False
             )
-            await log_channel.send(
-                embed=log_embed,
-                allowed_mentions=discord.AllowedMentions.none()
+            log_embed.set_thumbnail(url=self.target_user.display_avatar.url)
+            log_embed.set_footer(
+                text=(
+                    f"ID użytkownika: {self.target_user.id} • "
+                    f"Usunięte wiadomości: {deleted_messages}"
+                )
             )
+            try:
+                await log_channel.send(
+                    embed=log_embed,
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+                log_sent = True
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się wysłać logu cofniętej nieobecności: {error}")
 
         await interaction.edit_original_response(
             content=(
                 f"✅ Cofnięto nieobecność {self.target_user.mention} dla "
                 f"**{recording_display_name(recording)}**."
                 + ("" if dm_sent else " ⚠️ Nie udało się wysłać wiadomości prywatnej.")
+                + ("" if log_sent else " ⚠️ Nie udało się wysłać logu na kanał nagrywki-logi.")
             ),
             view=None
         )
