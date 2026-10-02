@@ -1933,7 +1933,9 @@ async def save_double_attendance_choice(
                 inline=False
             )
         log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        log_embed.set_footer(text=f"ID użytkownika: {interaction.user.id}")
+        log_embed.set_footer(
+            text=f"Grupa: {group_id} • ID użytkownika: {interaction.user.id}"
+        )
         try:
             await log_channel.send(
                 embed=log_embed,
@@ -1960,9 +1962,9 @@ async def backfill_double_attendance_logs():
             print(f"❌ Nie znaleziono kanału nagrywki-logi: {NAGRYWKI_LOGS_CHANNEL_ID}")
             return
 
-    # Najnowsze logi mogły zostać wysłane przez wersję sprzed dodania znacznika
-    # logged_at. Rozpoznaj je po stopce, aby nie dublować ich po wdrożeniu.
-    already_logged_user_ids = set()
+    # Zachowujemy treść istniejących logów. Samo ID użytkownika nie wystarcza,
+    # bo ta sama osoba może mieć logi z wielu różnych nagrywek X2.
+    historical_log_embeds = []
     try:
         async for message in log_channel.history(limit=100):
             if not message.embeds:
@@ -1970,15 +1972,7 @@ async def backfill_double_attendance_logs():
             embed = message.embeds[0]
             if "nagrywka X2" not in (embed.title or ""):
                 continue
-            footer_text = embed.footer.text or ""
-            if "ID użytkownika:" not in footer_text:
-                continue
-            try:
-                already_logged_user_ids.add(
-                    int(footer_text.rsplit("ID użytkownika:", 1)[1].strip())
-                )
-            except ValueError:
-                continue
+            historical_log_embeds.append(embed)
     except (discord.Forbidden, discord.HTTPException):
         pass
 
@@ -2001,14 +1995,28 @@ async def backfill_double_attendance_logs():
         )
         pending_choices = await asyncio.to_thread(
             lambda current_group=group_id: list(
-                recording_attendance_choices_collection.find({
-                    "group_id": current_group,
-                    "logged_at": {"$exists": False}
-                })
+                recording_attendance_choices_collection.find({"group_id": current_group})
             )
         )
         for choice in pending_choices:
-            if int(choice["user_id"]) in already_logged_user_ids:
+            recording_names = {
+                recording_display_name(recording) for recording in recordings
+            }
+            user_marker = f"ID użytkownika: {choice['user_id']}"
+            mention_marker = f"<@{choice['user_id']}>"
+            log_already_exists = any(
+                (
+                    user_marker in (old_embed.footer.text or "")
+                    or mention_marker in (old_embed.description or "")
+                )
+                and any(
+                    name in (old_embed.description or "")
+                    or any(name in field.name or name in field.value for field in old_embed.fields)
+                    for name in recording_names
+                )
+                for old_embed in historical_log_embeds
+            )
+            if log_already_exists:
                 await asyncio.to_thread(
                     recording_attendance_choices_collection.update_one,
                     {"_id": choice["_id"]},
@@ -2069,7 +2077,10 @@ async def backfill_double_attendance_logs():
                     inline=False
                 )
             embed.set_footer(
-                text=f"Nadrobiony automatycznie • ID użytkownika: {choice['user_id']}"
+                text=(
+                    f"Nadrobiony automatycznie • Grupa: {group_id} • "
+                    f"ID użytkownika: {choice['user_id']}"
+                )
             )
             try:
                 await log_channel.send(
@@ -2657,21 +2668,65 @@ async def collect_absence_authors(thread_ids, nagrywka=None):
 
     return authors_by_forum
 
-async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
-    selected_ids = {int(value) for value in selected_ids}
+async def synchronize_double_group_attendance(group_id):
     group_recordings = await asyncio.to_thread(
         lambda: list(recordings_collection.find({"double_group_id": group_id}))
     )
+    choices = await asyncio.to_thread(
+        lambda: list(recording_attendance_choices_collection.find({"group_id": group_id}))
+    )
+    absences = await asyncio.to_thread(
+        lambda: list(recording_absences_collection.find({
+            "group_id": group_id,
+            "confirmed": True
+        }))
+    )
+
     for group_recording in group_recordings:
-        if int(group_recording.get("message_id", 0)) not in selected_ids:
-            continue
+        recording_id = int(group_recording.get("message_id", 0))
+        absent_user_ids = {
+            int(absence["user_id"])
+            for absence in absences
+            if recording_id in {
+                int(value) for value in absence.get("recording_message_ids", [])
+            }
+        }
+        participant_ids = sorted({
+            int(choice["user_id"])
+            for choice in choices
+            if recording_id in {
+                int(value) for value in choice.get("recording_message_ids", [])
+            }
+            and int(choice["user_id"]) not in absent_user_ids
+        })
         await asyncio.to_thread(
             recordings_collection.update_one,
             {"_id": group_recording["_id"]},
-            {"$pull": {
-                "uczestnicy": {"$in": [int(user_id), str(user_id)]}
-            }}
+            {"$set": {"uczestnicy": participant_ids}}
         )
+
+    refreshed = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": group_id}))
+    )
+    if not refreshed:
+        return
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    if channel is None:
+        return
+    try:
+        announcement = await channel.fetch_message(
+            int(refreshed[0]["announcement_message_id"])
+        )
+        await announcement.edit(
+            embed=build_double_recording_embed(refreshed),
+            view=DoubleAttendanceView(group_id, refreshed) if len(refreshed) == 2 else None
+        )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+        print(f"❌ Nie udało się odświeżyć licznika X2 dla {group_id}: {error}")
+
+
+async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
+    selected_ids = {int(value) for value in selected_ids}
 
     attendance_choice = await asyncio.to_thread(
         recording_attendance_choices_collection.find_one,
@@ -2698,28 +2753,7 @@ async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
                 {"_id": attendance_choice["_id"]}
             )
 
-    refreshed = await asyncio.to_thread(
-        lambda: list(recordings_collection.find({"double_group_id": group_id}))
-    )
-    if not refreshed:
-        return
-    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
-    if channel is None:
-        return
-    try:
-        announcement = await channel.fetch_message(
-            int(refreshed[0]["announcement_message_id"])
-        )
-        view = (
-            DoubleAttendanceView(group_id, refreshed)
-            if len(refreshed) == 2 else None
-        )
-        await announcement.edit(
-            embed=build_double_recording_embed(refreshed),
-            view=view
-        )
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        pass
+    await synchronize_double_group_attendance(group_id)
 
 @bot.listen("on_message")
 async def enforce_double_absence_selection(message):
