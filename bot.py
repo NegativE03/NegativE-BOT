@@ -167,6 +167,7 @@ async def on_ready():
 
     await ensure_personal_stats_panel()
     await refresh_active_recording_messages()
+    await reconcile_existing_double_absences()
     await backfill_double_attendance_logs()
 
 # /ping
@@ -1405,8 +1406,11 @@ def double_recording_forum_content(recordings):
         f"1️⃣ **{recording_display_name(first)}:** od rozpoczęcia nagrywki\n"
         f"2️⃣ **{recording_display_name(second)}:** po zakończeniu etapu 1/2\n"
         f"🔊 **Kanał VC:** <#{NAGRYWKI_VC_ID}>\n\n"
-        "Aby zgłosić nieobecność, wybierz z listy pierwszy termin, drugi termin albo oba. "
-        "Sama wiadomość tekstowa nie przypisze nieobecności do żadnego terminu."
+        "### Jak zgłosić nieobecność?\n"
+        "**1.** Wybierz z listy etap 1/2, etap 2/2 albo oba.\n"
+        "**2.** Napisz poniżej powód nieobecności.\n\n"
+        "✅ Dopiero po wysłaniu powodu bot zapisze nieobecność i automatycznie usunie "
+        "Twoje potwierdzenie obecności z wybranych etapów."
     )
 
 class DoubleAbsenceSelect(Select):
@@ -1415,25 +1419,25 @@ class DoubleAbsenceSelect(Select):
         self.recordings = recordings
         first, second = recordings
         super().__init__(
-            placeholder="Wybierz termin, na którym Cię nie będzie...",
+            placeholder="Najpierw wybierz etap nieobecności...",
             min_values=1,
             max_values=1,
             options=[
                 discord.SelectOption(
-                    label=f"Tylko {recording_display_name(first)}"[:100],
-                    description="Etap 1/2 — od rozpoczęcia nagrywki",
+                    label="Nie będzie mnie na etapie 1/2",
+                    description=f"{recording_display_name(first)} — od rozpoczęcia",
                     value=str(first["message_id"]),
                     emoji="1️⃣"
                 ),
                 discord.SelectOption(
-                    label=f"Tylko {recording_display_name(second)}"[:100],
-                    description="Etap 2/2 — po zakończeniu pierwszego etapu",
+                    label="Nie będzie mnie na etapie 2/2",
+                    description=f"{recording_display_name(second)} — po etapie 1/2",
                     value=str(second["message_id"]),
                     emoji="2️⃣"
                 ),
                 discord.SelectOption(
-                    label="Obie nagrywki",
-                    description="Nie będzie mnie na żadnym z dwóch terminów",
+                    label="Nie będzie mnie na obu etapach",
+                    description="Nieobecność 1/2 oraz 2/2",
                     value="both",
                     emoji="⏩"
                 )
@@ -1465,6 +1469,8 @@ class DoubleAbsenceSelect(Select):
             },
             {"$set": {
                 "recording_message_ids": selected_ids,
+                "confirmed": False,
+                "reason_message_id": None,
                 "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
             }},
             upsert=True
@@ -1475,7 +1481,11 @@ class DoubleAbsenceSelect(Select):
             if int(recording["message_id"]) in selected_ids
         ]
         await interaction.edit_original_response(
-            content="✅ Zapisano nieobecność: **" + " i ".join(selected_names) + "**."
+            content=(
+                "📝 Wybrano: **" + " i ".join(selected_names) + "**.\n"
+                "Teraz napisz w tym poście **powód nieobecności**. Dopiero po wysłaniu "
+                "wiadomości nieobecność zostanie zapisana, a Twój zapis usunięty."
+            )
         )
 
 class DoubleAbsenceView(View):
@@ -1507,8 +1517,11 @@ def build_double_recording_embed(recordings):
     embed = discord.Embed(
         title="🎬 PODWÓJNA NAGRYWKA",
         description=(
-            "### 📢 Jeden start — dwa etapy i dwie osobne obecności\n"
-            "Wybierz przyciskiem, czy będziesz na obu, tylko na jednej albo się spóźnisz."
+            "### 📢 Jeden start — dwa osobno rozliczane etapy\n"
+            "**Jak się zapisać?**\n"
+            "• Będziesz cały czas → wybierz **Będę na obu**.\n"
+            "• Będziesz tylko na części → wybierz **Będę na jednym** i wskaż etap.\n"
+            "• Spóźnisz się → wybierz **Spóźnię się** i podaj powód."
         ),
         color=discord.Color.blurple()
     )
@@ -1684,6 +1697,34 @@ async def save_double_attendance_choice(
         return
 
     selected_id_set = {int(value) for value in selected_ids}
+    confirmed_absences = await asyncio.to_thread(
+        lambda: list(recording_absences_collection.find({
+            "group_id": group_id,
+            "user_id": interaction.user.id,
+            "confirmed": True
+        }))
+    )
+    absent_ids = {
+        int(value)
+        for absence in confirmed_absences
+        for value in absence.get("recording_message_ids", [])
+    }
+    conflicting_ids = selected_id_set & absent_ids
+    if conflicting_ids:
+        conflicting_names = [
+            recording_display_name(recording)
+            for recording in recordings
+            if int(recording["message_id"]) in conflicting_ids
+        ]
+        await interaction.edit_original_response(
+            content=(
+                "❌ Masz już zatwierdzoną nieobecność na: **"
+                + " i ".join(conflicting_names)
+                + "**. Najpierw administracja musi ją odrzucić lub usunąć."
+            )
+        )
+        return
+
     for recording in recordings:
         recording_id = int(recording["message_id"])
         if recording_id in selected_id_set:
@@ -2061,7 +2102,7 @@ class DoubleAttendanceView(View):
         self.recordings = sorted(recordings, key=lambda item: item.get("double_position", 0))
 
     @discord.ui.button(
-        label="Obecny na obu",
+        label="Będę na obu etapach",
         emoji="✅",
         style=discord.ButtonStyle.success,
         custom_id="double_attendance:both"
@@ -2076,7 +2117,7 @@ class DoubleAttendanceView(View):
         )
 
     @discord.ui.button(
-        label="Obecny tylko na jednej",
+        label="Będę na jednym etapie",
         emoji="1️⃣",
         style=discord.ButtonStyle.primary,
         custom_id="double_attendance:one"
@@ -2084,8 +2125,8 @@ class DoubleAttendanceView(View):
     async def present_one(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_message(
             (
-                "Wybierz termin, na którym będziesz obecny.\n"
-                "⚠️ Na drugi termin musisz później zgłosić nieobecność "
+                "Wybierz etap, na którym będziesz obecny.\n"
+                "⚠️ Na drugi etap musisz później zgłosić nieobecność "
                 "w odpowiednim poście."
             ),
             view=DoubleAttendanceTermView(self.group_id, self.recordings, "present"),
@@ -2100,7 +2141,7 @@ class DoubleAttendanceView(View):
     )
     async def late(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_message(
-            "Na którą nagrywkę się spóźnisz?",
+            "Wybierz etap, na który się spóźnisz. Następnie wpiszesz powód:",
             view=DoubleAttendanceTermView(self.group_id, self.recordings, "late"),
             ephemeral=True
         )
@@ -2469,6 +2510,7 @@ async def collect_absence_authors(thread_ids, nagrywka=None):
         selections = await asyncio.to_thread(
             lambda: list(recording_absences_collection.find({
                 "group_id": nagrywka["double_group_id"],
+                "confirmed": True,
                 "recording_message_ids": int(nagrywka["message_id"])
             }))
         )
@@ -2498,6 +2540,67 @@ async def collect_absence_authors(thread_ids, nagrywka=None):
 
     return authors_by_forum
 
+async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
+    selected_ids = {int(value) for value in selected_ids}
+    await asyncio.to_thread(
+        recordings_collection.update_many,
+        {
+            "double_group_id": group_id,
+            "message_id": {"$in": list(selected_ids)}
+        },
+        {"$pull": {
+            "uczestnicy": {"$in": [int(user_id), str(user_id)]}
+        }}
+    )
+
+    attendance_choice = await asyncio.to_thread(
+        recording_attendance_choices_collection.find_one,
+        {"group_id": group_id, "user_id": int(user_id)}
+    )
+    if attendance_choice is not None:
+        remaining_ids = [
+            int(value)
+            for value in attendance_choice.get("recording_message_ids", [])
+            if int(value) not in selected_ids
+        ]
+        if remaining_ids:
+            await asyncio.to_thread(
+                recording_attendance_choices_collection.update_one,
+                {"_id": attendance_choice["_id"]},
+                {"$set": {
+                    "recording_message_ids": remaining_ids,
+                    "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+                }}
+            )
+        else:
+            await asyncio.to_thread(
+                recording_attendance_choices_collection.delete_one,
+                {"_id": attendance_choice["_id"]}
+            )
+
+    refreshed = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": group_id}))
+    )
+    if not refreshed:
+        return
+    channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+    if channel is None:
+        return
+    try:
+        announcement = await channel.fetch_message(
+            int(refreshed[0]["announcement_message_id"])
+        )
+        view = (
+            DoubleAttendanceView(group_id, refreshed)
+            if len(refreshed) == 2 else None
+        )
+        await announcement.edit(
+            embed=build_double_recording_embed(refreshed),
+            view=view
+        )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
+
 @bot.listen("on_message")
 async def enforce_double_absence_selection(message):
     if message.author.bot or not isinstance(message.channel, discord.Thread):
@@ -2521,17 +2624,101 @@ async def enforce_double_absence_selection(message):
             "forum_id": message.channel.parent_id
         }
     )
-    if selection is not None:
+    if selection is None:
+        try:
+            await message.delete()
+            await message.author.send(
+                "❌ Najpierw wybierz z listy w poście nieobecności, czy nie będzie Cię "
+                "na etapie 1/2, 2/2 czy na obu. Dopiero potem wpisz powód."
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         return
 
+    selected_ids = [
+        int(value) for value in selection.get("recording_message_ids", [])
+    ]
+    await asyncio.to_thread(
+        recording_absences_collection.update_one,
+        {"_id": selection["_id"]},
+        {"$set": {
+            "confirmed": True,
+            "reason_message_id": message.id,
+            "reason_preview": message.content[:500],
+            "submitted_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+        }}
+    )
+    await remove_double_absence_from_signups(
+        recording["double_group_id"],
+        message.author.id,
+        selected_ids
+    )
     try:
-        await message.delete()
-        await message.author.send(
-            "❌ Najpierw wybierz z listy w poście nieobecności, czy nie będzie Cię "
-            "na pierwszej, drugiej czy obu nagrywkach. Dopiero potem wpisz powód."
-        )
+        await message.add_reaction("✅")
     except (discord.Forbidden, discord.HTTPException):
         pass
+
+async def reconcile_existing_double_absences():
+    selections = await asyncio.to_thread(
+        lambda: list(recording_absences_collection.find())
+    )
+    reconciled = 0
+    for selection in selections:
+        group_id = selection.get("group_id")
+        if not group_id:
+            continue
+        recordings = await asyncio.to_thread(
+            lambda current_group=group_id: list(
+                recordings_collection.find({"double_group_id": current_group})
+            )
+        )
+        if not recordings:
+            continue
+
+        has_reason = bool(selection.get("confirmed"))
+        reason_message_id = selection.get("reason_message_id")
+        if not has_reason:
+            forum_id = int(selection.get("forum_id", 0))
+            thread_ids = {
+                int(thread_id)
+                for recording in recordings
+                for thread_id in recording.get("forum_thread_ids", [])
+            }
+            for thread_id in thread_ids:
+                try:
+                    thread = bot.get_channel(thread_id) or await bot.fetch_channel(thread_id)
+                    if int(thread.parent_id) != forum_id:
+                        continue
+                    async for old_message in thread.history(limit=None, oldest_first=True):
+                        if old_message.author.id == int(selection["user_id"]):
+                            has_reason = True
+                            reason_message_id = old_message.id
+                            break
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    continue
+                if has_reason:
+                    break
+
+        if not has_reason:
+            continue
+        await asyncio.to_thread(
+            recording_absences_collection.update_one,
+            {"_id": selection["_id"]},
+            {"$set": {
+                "confirmed": True,
+                "reason_message_id": reason_message_id,
+                "reconciled_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+            }}
+        )
+        await remove_double_absence_from_signups(
+            group_id,
+            int(selection["user_id"]),
+            selection.get("recording_message_ids", [])
+        )
+        reconciled += 1
+
+    if reconciled:
+        print(f"✅ Zsynchronizowano zaległe nieobecności X2: {reconciled}")
 
 async def boss_has_work_credit(nagrywka):
     work_credit = await asyncio.to_thread(
@@ -2742,7 +2929,8 @@ def load_vacations():
     for doc in vacations_collection.find():
 
         vacations[str(doc["user_id"])] = {
-            "end": doc["end"]
+            key: value for key, value in doc.items()
+            if key not in {"_id", "user_id"}
         }
 
     return vacations
@@ -2764,14 +2952,17 @@ def save_vacations(data):
 
     for user_id, vacation in data.items():
 
+        payload = {
+            key: value for key, value in vacation.items()
+            if key != "_id"
+        }
+
         vacations_collection.update_one(
             {
                 "user_id": int(user_id)
             },
             {
-                "$set": {
-                    "end": vacation["end"]
-                }
+                "$set": payload
             },
             upsert=True
         )
@@ -2843,12 +3034,16 @@ def refresh_recording_lock(recordings):
 )
 @app_commands.describe(
     user="Nagrywkowicz",
-    dni="Liczba dni urlopu"
+    dni="Liczba dni urlopu",
+    wiadomosc="Link do wiadomości ze zgłoszeniem urlopu",
+    notatka="Opcjonalna notatka administracji"
 )
 async def nadajurlop(
     interaction: discord.Interaction,
     user: discord.Member,
-    dni: int
+    dni: int,
+    wiadomosc: str,
+    notatka: str = None
 ):
     await interaction.response.defer(
         ephemeral=True
@@ -2888,7 +3083,11 @@ async def nadajurlop(
     vacations = load_vacations()
 
     vacations[str(user.id)] = {
-        "end": end_date.isoformat()
+        "end": end_date.isoformat(),
+        "note": notatka,
+        "message_url": wiadomosc,
+        "approved_by": interaction.user.id,
+        "approved_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
     }
 
     save_vacations(vacations)
@@ -2897,8 +3096,10 @@ async def nadajurlop(
         await user.send(
             f"🏖️ Twój urlop został zaakceptowany.\n\n"
             f"📅 Długość: **{dni} dni**\n"
-            f"⏰ Powrót: **{end_date.strftime('%d.%m.%Y %H:%M')}**\n\n"
-            f"Do zobaczenia na nagrywkach! 🎬"
+            f"⏰ Powrót: **{end_date.strftime('%d.%m.%Y %H:%M')}**\n"
+            f"🔗 Zgłoszenie: {wiadomosc}\n"
+            + (f"📝 Notatka: **{notatka}**\n" if notatka else "")
+            + "\nDo zobaczenia na nagrywkach! 🎬"
         )
     except:
         pass
@@ -2934,10 +3135,82 @@ async def nadajurlop(
         inline=False
     )
 
+    embed.add_field(
+        name="🔗 Zgłoszenie urlopowe",
+        value=f"[Przejdź do wiadomości]({wiadomosc})",
+        inline=False
+    )
+    if notatka:
+        embed.add_field(
+            name="📝 Notatka administracji",
+            value=notatka[:1024],
+            inline=False
+        )
+
     await log_channel.send(embed=embed)
 
     await interaction.followup.send(
         f"✅ Nadano urlop dla {user.mention}.",
+        ephemeral=True
+    )
+
+@bot.tree.command(
+    name="odrzucurlop",
+    description="Odrzuca zgłoszenie urlopowe wraz z powodem"
+)
+@app_commands.describe(
+    user="Osoba, której zgłoszenie odrzucasz",
+    powod="Powód odrzucenia urlopu",
+    wiadomosc="Link do wiadomości ze zgłoszeniem urlopu"
+)
+async def odrzucurlop(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    powod: str,
+    wiadomosc: str
+):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    dm_sent = True
+    try:
+        await user.send(
+            "❌ **Twoje zgłoszenie urlopowe zostało odrzucone.**\n\n"
+            f"📝 Powód: **{powod}**\n"
+            f"🔗 Zgłoszenie: {wiadomosc}\n\n"
+            "Jeśli potrzebujesz wyjaśnienia, skontaktuj się z administracją."
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        dm_sent = False
+
+    log_channel = bot.get_channel(VACATION_LOG_CHANNEL_ID)
+    if log_channel is not None:
+        embed = discord.Embed(
+            title="❌ Zgłoszenie urlopowe odrzucone",
+            color=discord.Color.red(),
+            timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+        )
+        embed.add_field(name="🎬 Nagrywkowicz", value=user.mention, inline=False)
+        embed.add_field(name="👤 Odrzucił", value=interaction.user.mention, inline=False)
+        embed.add_field(name="📝 Powód", value=powod[:1024], inline=False)
+        embed.add_field(
+            name="🔗 Zgłoszenie urlopowe",
+            value=f"[Przejdź do wiadomości]({wiadomosc})",
+            inline=False
+        )
+        embed.set_footer(text=f"ID użytkownika: {user.id}")
+        await log_channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    await send_response(
+        interaction,
+        (
+            f"✅ Odrzucono zgłoszenie urlopowe {user.mention}."
+            + ("" if dm_sent else " ⚠️ Nie udało się wysłać wiadomości prywatnej.")
+        ),
         ephemeral=True
     )
 
@@ -4708,6 +4981,186 @@ async def usunobecnosc(
         result += "\n⚠️ Wpis w bazie usunięto, ale nie udało się usunąć reakcji na Discordzie."
 
     await send_response(interaction, result, ephemeral=True)
+
+class RejectAbsenceSelect(Select):
+    def __init__(self, recordings, target_user, reason):
+        self.recordings = recordings
+        self.target_user = target_user
+        self.reason = reason
+        super().__init__(
+            placeholder="Wybierz nagrywkę, której nieobecność odrzucasz...",
+            min_values=1,
+            max_values=1,
+            options=recording_select_options(recordings)
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+            await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message_id = self.values[0]
+        recording = load_recordings().get(message_id)
+        if recording is None:
+            await interaction.edit_original_response(
+                content="❌ Ta nagrywka nie jest już aktywna.",
+                view=None
+            )
+            return
+
+        absence_removed = False
+        forums_to_clear = set()
+        if recording.get("double_group_id"):
+            selections = await asyncio.to_thread(
+                lambda: list(recording_absences_collection.find({
+                    "group_id": recording["double_group_id"],
+                    "user_id": self.target_user.id,
+                    "recording_message_ids": int(message_id)
+                }))
+            )
+            for selection in selections:
+                remaining_ids = [
+                    int(value)
+                    for value in selection.get("recording_message_ids", [])
+                    if int(value) != int(message_id)
+                ]
+                if remaining_ids:
+                    await asyncio.to_thread(
+                        recording_absences_collection.update_one,
+                        {"_id": selection["_id"]},
+                        {"$set": {
+                            "recording_message_ids": remaining_ids,
+                            "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+                        }}
+                    )
+                else:
+                    await asyncio.to_thread(
+                        recording_absences_collection.delete_one,
+                        {"_id": selection["_id"]}
+                    )
+                    forums_to_clear.add(int(selection["forum_id"]))
+                absence_removed = True
+        else:
+            forums_to_clear.update(NIEOBECNOSCI_FORUM_IDS)
+
+        deleted_messages = 0
+        thread_ids_to_scan = (
+            await find_recording_forum_threads(recording)
+            if not recording.get("double_group_id") or forums_to_clear
+            else []
+        )
+        for thread_id in thread_ids_to_scan:
+            try:
+                thread = bot.get_channel(int(thread_id)) or await bot.fetch_channel(int(thread_id))
+                if forums_to_clear and int(thread.parent_id) not in forums_to_clear:
+                    continue
+                async for message in thread.history(limit=None):
+                    if message.author.id != self.target_user.id:
+                        continue
+                    await message.delete(
+                        reason=f"Nieobecność odrzucona przez {interaction.user}"
+                    )
+                    deleted_messages += 1
+                    absence_removed = True
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                print(f"❌ Nie udało się usunąć wiadomości nieobecności z {thread_id}: {error}")
+
+        if not absence_removed:
+            await interaction.edit_original_response(
+                content=(
+                    f"❌ {self.target_user.mention} nie ma zapisanej nieobecności "
+                    f"dla **{recording_display_name(recording)}**."
+                ),
+                view=None
+            )
+            return
+
+        announcement_id = int(recording.get("announcement_message_id", message_id))
+        announcement_url = (
+            f"https://discord.com/channels/{GUILD_ID}/{NAGRYWKI_CHANNEL_ID}/{announcement_id}"
+        )
+        dm_sent = True
+        try:
+            await self.target_user.send(
+                "❌ **Twoja nieobecność została odrzucona.**\n\n"
+                f"🎬 **{recording_display_name(recording)}**\n"
+                f"📅 {recording['data']} • 🕒 {recording['godzina']}\n"
+                f"📝 Powód: **{self.reason}**\n"
+                f"🔗 Nagrywka: {announcement_url}\n\n"
+                "Musisz ponownie określić swoją obecność na tę nagrywkę."
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            dm_sent = False
+
+        log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+        if log_channel is not None:
+            log_embed = discord.Embed(
+                title="❌ Odrzucono nieobecność",
+                description=f"**{recording_display_name(recording)}**",
+                color=discord.Color.red(),
+                timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+            )
+            log_embed.add_field(name="👤 Osoba", value=self.target_user.mention, inline=True)
+            log_embed.add_field(name="🛡️ Odrzucił", value=interaction.user.mention, inline=True)
+            log_embed.add_field(
+                name="📅 Termin",
+                value=f"{recording['data']} • {recording['godzina']}",
+                inline=False
+            )
+            log_embed.add_field(name="📝 Powód", value=self.reason[:1024], inline=False)
+            log_embed.add_field(
+                name="🔗 Nagrywka",
+                value=f"[Przejdź do wiadomości]({announcement_url})",
+                inline=False
+            )
+            await log_channel.send(
+                embed=log_embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+
+        await interaction.edit_original_response(
+            content=(
+                f"✅ Odrzucono nieobecność {self.target_user.mention} dla "
+                f"**{recording_display_name(recording)}**."
+                + ("" if dm_sent else " ⚠️ Nie udało się wysłać wiadomości prywatnej.")
+            ),
+            view=None
+        )
+
+class RejectAbsenceView(View):
+    def __init__(self, recordings, target_user, reason):
+        super().__init__(timeout=120)
+        self.add_item(RejectAbsenceSelect(recordings, target_user, reason))
+
+@bot.tree.command(
+    name="odrzucnieobecnosc",
+    description="Odrzuca zgłoszoną nieobecność i wysyła osobie powód"
+)
+@app_commands.describe(
+    user="Osoba, której nieobecność odrzucasz",
+    powod="Powód odrzucenia nieobecności"
+)
+async def odrzucnieobecnosc(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    powod: str
+):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    recordings = load_recordings()
+    if not recordings:
+        await send_response(interaction, "❌ Brak aktywnych nagrywek.", ephemeral=True)
+        return
+
+    await send_response(
+        interaction,
+        f"🎬 Wybierz nagrywkę, dla której odrzucasz nieobecność {user.mention}:",
+        view=RejectAbsenceView(recordings, user, powod),
+        ephemeral=True
+    )
 
 @bot.tree.command(
     name="statusnagrywki",
