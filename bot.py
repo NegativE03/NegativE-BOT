@@ -2906,11 +2906,24 @@ async def synchronize_double_group_attendance(group_id):
 async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
     selected_ids = {int(value) for value in selected_ids}
 
-    attendance_choice = await asyncio.to_thread(
-        recording_attendance_choices_collection.find_one,
-        {"group_id": group_id, "user_id": int(user_id)}
+    await asyncio.to_thread(
+        recordings_collection.update_many,
+        {
+            "double_group_id": group_id,
+            "message_id": {"$in": list(selected_ids)}
+        },
+        {"$pull": {
+            "uczestnicy": {"$in": [int(user_id), str(user_id)]}
+        }}
     )
-    if attendance_choice is not None:
+
+    attendance_choices = await asyncio.to_thread(
+        lambda: list(recording_attendance_choices_collection.find({
+            "group_id": group_id,
+            "user_id": {"$in": [int(user_id), str(user_id)]}
+        }))
+    )
+    for attendance_choice in attendance_choices:
         remaining_ids = [
             int(value)
             for value in attendance_choice.get("recording_message_ids", [])
@@ -4243,7 +4256,16 @@ async def check_recordings():
         # ZAMKNIĘCIE I ZABLOKOWANIE POSTÓW 3H PRZED NAGRYWKĄ
         if roznica <= 10800 and not nagrywka.get("forums_closed", False):
             forum_thread_ids = nagrywka.get("forum_thread_ids", [])
+            if not forum_thread_ids:
+                forum_thread_ids = await find_recording_forum_threads(nagrywka)
             all_forums_closed = True
+
+            if not forum_thread_ids:
+                print(
+                    f"❌ Brak postów nieobecności do zamknięcia dla "
+                    f"{recording_display_name(nagrywka)}"
+                )
+                all_forums_closed = False
 
             for thread_id in forum_thread_ids:
                 thread = bot.get_channel(int(thread_id))
@@ -4274,6 +4296,10 @@ async def check_recordings():
             if all_forums_closed:
                 nagrywka["forums_closed"] = True
                 changed = True
+                print(
+                    f"🔒 Zamknięto nieobecności dla {recording_display_name(nagrywka)} "
+                    f"o {now.strftime('%d.%m.%Y %H:%M:%S')} Europe/Warsaw"
+                )
 
         # PRYWATNE PRZYPOMNIENIE O BRAKU ODPOWIEDZI 8H PRZED
         if (
