@@ -4238,6 +4238,79 @@ async def send_double_signup_report(group_id, manual_by=None):
     return True
 
 
+async def send_double_recording_reminders(group_id, guild):
+    recordings = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": group_id}))
+    )
+    if len(recordings) != 2 or guild is None:
+        return 0
+    recordings.sort(key=lambda item: int(item.get("double_position", 0)))
+    first, second = recordings
+    first_ids = {int(user_id) for user_id in first.get("uczestnicy", [])}
+    second_ids = {int(user_id) for user_id in second.get("uczestnicy", [])}
+    announcement_id = int(first["announcement_message_id"])
+    announcement_url = (
+        f"https://discord.com/channels/{GUILD_ID}/"
+        f"{NAGRYWKI_CHANNEL_ID}/{announcement_id}"
+    )
+
+    sent = 0
+    for user_id in sorted(first_ids | second_ids):
+        member = guild.get_member(user_id)
+        if member and any(role.id == URLOP_ROLE_ID for role in member.roles):
+            continue
+        try:
+            user = member or await bot.fetch_user(user_id)
+            if user_id in first_ids and user_id in second_ids:
+                signup_text = (
+                    f"✅ **Oba etapy**\n"
+                    f"1️⃣ {recording_display_name(first)}\n"
+                    f"2️⃣ {recording_display_name(second)}"
+                )
+            elif user_id in first_ids:
+                signup_text = f"1️⃣ **Tylko etap 1/2** — {recording_display_name(first)}"
+            else:
+                signup_text = f"2️⃣ **Tylko etap 2/2** — {recording_display_name(second)}"
+
+            embed = discord.Embed(
+                title="⏰ Za godzinę podwójna nagrywka!",
+                description=(
+                    "Przygotuj się do nagrywki X2. Poniżej znajdziesz swój zapis "
+                    "oraz najważniejsze informacje."
+                ),
+                color=discord.Color.blurple(),
+                timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+            )
+            embed.add_field(
+                name="📅 Start nagrywki X2",
+                value=f"**{first['data']} o {first['godzina']}** (Europe/Warsaw)",
+                inline=False
+            )
+            embed.add_field(
+                name="🎟️ Twój zapis",
+                value=signup_text,
+                inline=False
+            )
+            embed.add_field(
+                name="🔊 Gdzie się pojawić?",
+                value=f"Kanał głosowy: <#{NAGRYWKI_VC_ID}>",
+                inline=False
+            )
+            embed.add_field(
+                name="🔗 Termin",
+                value=f"[Przejdź do wiadomości nagrywki]({announcement_url})",
+                inline=False
+            )
+            if bot.user:
+                embed.set_thumbnail(url=bot.user.display_avatar.url)
+            embed.set_footer(text="NegativE* • Automatyczne przypomnienie godzinę przed X2")
+            await user.send(embed=embed)
+            sent += 1
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+    return sent
+
+
 @bot.tree.command(
     name="raportzapisowx2",
     description="Wysyła raport osób zapisanych na poszczególne etapy nagrywki X2"
@@ -4499,46 +4572,51 @@ async def check_recordings():
         ):
 
             guild = bot.get_guild(GUILD_ID)
+            if (
+                nagrywka.get("double_group_id")
+                and int(nagrywka.get("double_position", 0)) == 1
+            ):
+                sent_count = await send_double_recording_reminders(
+                    nagrywka["double_group_id"], guild
+                )
+                await asyncio.to_thread(
+                    recordings_collection.update_many,
+                    {"double_group_id": nagrywka["double_group_id"]},
+                    {"$set": {"reminder_sent": True}}
+                )
+                nagrywka["reminder_sent"] = True
+                print(f"✅ Wysłano przypomnienie X2 do {sent_count} osób")
+                changed = True
+            elif not nagrywka.get("double_group_id"):
+                for user_id in nagrywka["uczestnicy"]:
+                    if guild is None:
+                        break
+                    try:
+                        user = await bot.fetch_user(user_id)
+                    except (discord.NotFound, discord.HTTPException):
+                        continue
 
-            for user_id in nagrywka["uczestnicy"]:
+                    member = guild.get_member(user_id)
+                    if member and any(
+                        role.id == URLOP_ROLE_ID for role in member.roles
+                    ):
+                        continue
 
-                if guild is None:
-                    break
+                    try:
+                        await user.send(
+                            f"⏰ **Przypomnienie!**\n\n"
+                            f"Za godzinę rozpoczyna się nagrywka:\n\n"
+                            f"🎬 {nagrywka['opis']}\n"
+                            f"📅 {nagrywka['data']}\n"
+                            f"🕒 {nagrywka['godzina']}\n\n"
+                            f"🔊 Kanał:\n"
+                            f"<#{NAGRYWKI_VC_ID}>"
+                        )
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
 
-                try:
-                    user = await bot.fetch_user(user_id)
-                except:
-                    continue
-
-                member = guild.get_member(user_id)
-
-                if (
-                    member
-                    and any(
-                        role.id == URLOP_ROLE_ID
-                        for role in member.roles
-                    )
-                ):
-                    continue
-
-                try:
-
-                    await user.send(
-                        f"⏰ **Przypomnienie!**\n\n"
-                        f"Za godzinę rozpoczyna się nagrywka:\n\n"
-                        f"🎬 {nagrywka['opis']}\n"
-                        f"📅 {nagrywka['data']}\n"
-                        f"🕒 {nagrywka['godzina']}\n\n"
-                        f"🔊 Kanał:\n"
-                        f"<#{NAGRYWKI_VC_ID}>"
-                    )
-
-                except:
-                    pass
-
-            nagrywka["reminder_sent"] = True
-
-            changed = True
+                nagrywka["reminder_sent"] = True
+                changed = True
 
 
         # START NAGRYWKI
