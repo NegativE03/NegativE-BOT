@@ -2903,7 +2903,9 @@ async def synchronize_double_group_attendance(group_id):
     return count_changes
 
 
-async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
+async def remove_double_absence_from_signups(
+    group_id, user_id, selected_ids, sync_after=True
+):
     selected_ids = {int(value) for value in selected_ids}
 
     await asyncio.to_thread(
@@ -2944,7 +2946,8 @@ async def remove_double_absence_from_signups(group_id, user_id, selected_ids):
                 {"_id": attendance_choice["_id"]}
             )
 
-    await synchronize_double_group_attendance(group_id)
+    if sync_after:
+        await synchronize_double_group_attendance(group_id)
 
 @bot.listen("on_message")
 async def enforce_double_absence_selection(message):
@@ -3023,6 +3026,7 @@ async def reconcile_existing_double_absences():
         lambda: list(recording_absences_collection.find())
     )
     reconciled = 0
+    groups_to_sync = set()
     for selection in selections:
         group_id = selection.get("group_id")
         if not group_id:
@@ -3078,14 +3082,19 @@ async def reconcile_existing_double_absences():
         await remove_double_absence_from_signups(
             group_id,
             int(selection["user_id"]),
-            selection.get("recording_message_ids", [])
+            selection.get("recording_message_ids", []),
+            sync_after=False
         )
+        groups_to_sync.add(group_id)
         print(
             "✅ Nieobecność X2 zsynchronizowana: "
             f"user={selection['user_id']}, "
             f"nagrywki={selection.get('recording_message_ids', [])}"
         )
         reconciled += 1
+
+    for group_id in groups_to_sync:
+        await synchronize_double_group_attendance(group_id)
 
     if reconciled:
         print(f"✅ Zsynchronizowano zaległe nieobecności X2: {reconciled}")
@@ -4149,6 +4158,117 @@ async def send_missing_response_report(nagrywka, guild, manual_by=None):
     )
     return True
 
+
+async def send_double_signup_report(group_id, manual_by=None):
+    recordings = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({"double_group_id": group_id}))
+    )
+    if len(recordings) != 2:
+        return False
+    recordings.sort(key=lambda item: int(item.get("double_position", 0)))
+    first, second = recordings
+
+    first_ids = {int(user_id) for user_id in first.get("uczestnicy", [])}
+    second_ids = {int(user_id) for user_id in second.get("uczestnicy", [])}
+    both_ids = sorted(first_ids & second_ids)
+    only_first_ids = sorted(first_ids - second_ids)
+    only_second_ids = sorted(second_ids - first_ids)
+
+    def mentions(user_ids):
+        return "\n".join(f"<@{user_id}>" for user_id in user_ids) or "*Brak osób*"
+
+    report_channel = bot.get_channel(REPORT_CHANNEL_ID)
+    if report_channel is None:
+        try:
+            report_channel = await bot.fetch_channel(REPORT_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return False
+
+    announcement_id = int(first["announcement_message_id"])
+    announcement_url = (
+        f"https://discord.com/channels/{GUILD_ID}/"
+        f"{NAGRYWKI_CHANNEL_ID}/{announcement_id}"
+    )
+    embed = discord.Embed(
+        title="📋 Raport zapisów — nagrywka X2",
+        description=(
+            f"📅 **{first['data']}** • 🕒 **{first['godzina']}**\n"
+            f"1️⃣ **{recording_display_name(first)}**\n"
+            f"2️⃣ **{recording_display_name(second)}**\n\n"
+            f"[Przejdź do terminu]({announcement_url})"
+        ),
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    embed.add_field(
+        name=f"✅ Oba etapy — {len(both_ids)}",
+        value=mentions(both_ids)[:1024],
+        inline=False
+    )
+    embed.add_field(
+        name=f"1️⃣ Tylko etap 1/2 — {len(only_first_ids)}",
+        value=mentions(only_first_ids)[:1024],
+        inline=True
+    )
+    embed.add_field(
+        name=f"2️⃣ Tylko etap 2/2 — {len(only_second_ids)}",
+        value=mentions(only_second_ids)[:1024],
+        inline=True
+    )
+    embed.add_field(
+        name="👥 Łączne zapisy",
+        value=(
+            f"Etap 1/2: **{len(first_ids)}**\n"
+            f"Etap 2/2: **{len(second_ids)}**\n"
+            f"Unikalne osoby: **{len(first_ids | second_ids)}**"
+        ),
+        inline=False
+    )
+    embed.set_footer(
+        text=(
+            "Raport automatyczny • godzinę przed nagrywką"
+            if manual_by is None else
+            f"Raport ręczny • wywołał {manual_by}"
+        )
+    )
+    await report_channel.send(
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+    return True
+
+
+@bot.tree.command(
+    name="raportzapisowx2",
+    description="Wysyła raport osób zapisanych na poszczególne etapy nagrywki X2"
+)
+async def raportzapisowx2(interaction: discord.Interaction):
+    if not any(role.id in STAFF_ROLES for role in interaction.user.roles):
+        await send_response(interaction, "❌ Nie masz uprawnień.", ephemeral=True)
+        return
+
+    recordings = await asyncio.to_thread(
+        lambda: list(recordings_collection.find({
+            "double_group_id": {"$exists": True}
+        }))
+    )
+    if not recordings:
+        await send_response(interaction, "❌ Brak aktywnej nagrywki X2.", ephemeral=True)
+        return
+
+    group_id = recordings[0]["double_group_id"]
+    await synchronize_double_group_attendance(group_id)
+    sent = await send_double_signup_report(
+        group_id,
+        manual_by=interaction.user.display_name
+    )
+    await send_response(
+        interaction,
+        "✅ Raport zapisów X2 wysłany na kanał raportów."
+        if sent else "❌ Nie udało się wysłać raportu X2.",
+        ephemeral=True
+    )
+
 @bot.tree.command(
     name="raportbrakuodpowiedzi",
     description="Wysyła raport osób bez potwierdzenia dla aktywnej nagrywki"
@@ -4347,6 +4467,21 @@ async def check_recordings():
             changed = True
 
         # RAPORT BRAKU ODPOWIEDZI 1H PRZED
+        if (
+            nagrywka.get("double_group_id")
+            and int(nagrywka.get("double_position", 0)) == 1
+            and not nagrywka.get("x2_signup_report_sent", False)
+            and 0 <= roznica <= 3600
+        ):
+            if await send_double_signup_report(nagrywka["double_group_id"]):
+                nagrywka["x2_signup_report_sent"] = True
+                await asyncio.to_thread(
+                    recordings_collection.update_many,
+                    {"double_group_id": nagrywka["double_group_id"]},
+                    {"$set": {"x2_signup_report_sent": True}}
+                )
+                changed = True
+
         if (
             not nagrywka.get("report_sent", False)
             and roznica <= 3600
