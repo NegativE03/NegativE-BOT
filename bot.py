@@ -38,6 +38,7 @@ recording_locks_collection = db["recording_locks"]
 recording_absences_collection = db["recording_absences"]
 recording_attendance_choices_collection = db["recording_attendance_choices"]
 recording_lateness_reports_collection = db["recording_lateness_reports"]
+single_recording_lateness_collection = db["single_recording_lateness"]
 bot_state_collection = db["bot_state"]
 
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -1237,6 +1238,16 @@ async def on_raw_reaction_remove(payload):
 
         if str(payload.emoji) == "✅":
 
+            late_record = await asyncio.to_thread(
+                single_recording_lateness_collection.find_one,
+                {
+                    "recording_message_id": int(payload.message_id),
+                    "user_id": int(payload.user_id)
+                }
+            )
+            if late_record is not None:
+                return
+
             if payload.user_id in nagrywka["uczestnicy"]:
 
                 nagrywka["uczestnicy"].remove(
@@ -2419,6 +2430,213 @@ async def restore_double_attendance_views():
                 message_id=int(recordings[0]["announcement_message_id"])
             )
 
+
+async def get_single_late_user_ids(message_id):
+    documents = await asyncio.to_thread(
+        lambda: list(single_recording_lateness_collection.find({
+            "recording_message_id": int(message_id)
+        }))
+    )
+    return {int(document["user_id"]) for document in documents}
+
+
+async def update_single_lateness_report(nagrywka):
+    message_id = int(nagrywka["message_id"])
+    entries = await asyncio.to_thread(
+        lambda: list(single_recording_lateness_collection.find({
+            "recording_message_id": message_id
+        }))
+    )
+    report_channel = bot.get_channel(REPORT_CHANNEL_ID)
+    if report_channel is None:
+        try:
+            report_channel = await bot.fetch_channel(REPORT_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    lines = [
+        f"<@{entry['user_id']}> — {entry.get('reason', 'Brak powodu')}"
+        for entry in entries
+    ]
+    embed = discord.Embed(
+        title="⏰ RAPORT SPÓŹNIEŃ — NAGRYWKA",
+        description=(
+            f"🎬 **{recording_display_name(nagrywka)}**\n"
+            f"📅 {nagrywka['data']} • 🕒 {nagrywka['godzina']}\n\n"
+            + ("\n".join(lines) if lines else "Brak zgłoszonych spóźnień.")
+        )[:4096],
+        color=discord.Color.orange(),
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    embed.set_footer(text="NegativE* • Aktualizowany raport administracyjny")
+    report_data = await asyncio.to_thread(
+        recording_lateness_reports_collection.find_one,
+        {"recording_message_id": message_id}
+    )
+    report_message = None
+    if report_data and report_data.get("message_id"):
+        try:
+            report_message = await report_channel.fetch_message(int(report_data["message_id"]))
+            await report_message.edit(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            report_message = None
+    if report_message is None:
+        try:
+            report_message = await report_channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            return
+    await asyncio.to_thread(
+        recording_lateness_reports_collection.update_one,
+        {"recording_message_id": message_id},
+        {"$set": {
+            "message_id": report_message.id,
+            "channel_id": report_channel.id,
+            "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+        }},
+        upsert=True
+    )
+
+
+class SingleRecordingLateModal(Modal, title="Zgłoszenie spóźnienia"):
+    reason = TextInput(
+        label="Powód spóźnienia",
+        placeholder="Napisz krótko, dlaczego się spóźnisz...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+
+    def __init__(self, recording_message_id):
+        super().__init__()
+        self.recording_message_id = int(recording_message_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        nagrywka = await asyncio.to_thread(
+            recordings_collection.find_one,
+            {"message_id": self.recording_message_id}
+        )
+        if nagrywka is None or nagrywka.get("double_group_id"):
+            await interaction.edit_original_response(content="❌ Ta nagrywka nie jest już aktywna.")
+            return
+
+        allowed_roles = {NAGRYWKOWICZE_ROLE_ID, TESTOWI_ROLE_ID}
+        if not any(role.id in allowed_roles for role in interaction.user.roles):
+            await interaction.edit_original_response(
+                content="❌ Ta opcja jest dostępna tylko dla pomocników i testowych."
+            )
+            return
+
+        thread_ids = await find_recording_forum_threads(nagrywka)
+        absence_authors = await collect_absence_authors(thread_ids, nagrywka)
+        absent_ids = {
+            user_id for authors in absence_authors.values() for user_id in authors
+        }
+        if interaction.user.id in absent_ids:
+            await interaction.edit_original_response(
+                content=(
+                    "❌ Masz zapisaną nieobecność na tę nagrywkę. "
+                    "Administracja musi ją najpierw cofnąć."
+                )
+            )
+            return
+
+        now_text = datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+        await asyncio.to_thread(
+            single_recording_lateness_collection.update_one,
+            {
+                "recording_message_id": self.recording_message_id,
+                "user_id": interaction.user.id
+            },
+            {"$set": {
+                "reason": str(self.reason),
+                "updated_at": now_text
+            }},
+            upsert=True
+        )
+        await asyncio.to_thread(
+            recordings_collection.update_one,
+            {"_id": nagrywka["_id"]},
+            {"$addToSet": {"uczestnicy": interaction.user.id}}
+        )
+        nagrywka["uczestnicy"] = list(dict.fromkeys(
+            [int(value) for value in nagrywka.get("uczestnicy", [])]
+            + [interaction.user.id]
+        ))
+
+        channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+        if channel is not None:
+            try:
+                message = await channel.fetch_message(self.recording_message_id)
+                await message.edit(
+                    embed=build_recording_embed(nagrywka),
+                    view=SingleRecordingAttendanceView(self.recording_message_id)
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        log_channel = bot.get_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+        if log_channel is None:
+            try:
+                log_channel = await bot.fetch_channel(NAGRYWKI_LOGS_CHANNEL_ID)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                log_channel = None
+        if log_channel is not None:
+            log_embed = discord.Embed(
+                title="⏰ Zgłoszono spóźnienie",
+                description=f"{interaction.user.mention} zgłosił(a) spóźnienie.",
+                color=discord.Color.orange(),
+                timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+            )
+            log_embed.add_field(
+                name="🎬 Nagrywka",
+                value=f"**{recording_display_name(nagrywka)}**\n📅 {nagrywka['data']} • 🕒 {nagrywka['godzina']}",
+                inline=False
+            )
+            log_embed.add_field(name="📝 Powód", value=str(self.reason)[:1024], inline=False)
+            log_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            await log_channel.send(
+                embed=log_embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+
+        await update_single_lateness_report(nagrywka)
+        await interaction.edit_original_response(
+            content=(
+                f"✅ Zapisano spóźnienie na **{recording_display_name(nagrywka)}**. "
+                "Powód trafił do raportu administracji."
+            )
+        )
+
+
+class SingleRecordingLateButton(Button):
+    def __init__(self, recording_message_id):
+        super().__init__(
+            label="Spóźnię się",
+            emoji="⏰",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"single_late:{recording_message_id}"
+        )
+        self.recording_message_id = int(recording_message_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            SingleRecordingLateModal(self.recording_message_id)
+        )
+
+
+class SingleRecordingAttendanceView(View):
+    def __init__(self, recording_message_id):
+        super().__init__(timeout=None)
+        self.add_item(SingleRecordingLateButton(recording_message_id))
+
+
 def build_recording_embed(nagrywka):
     try:
         termin = datetime.fromisoformat(nagrywka["timestamp"])
@@ -2433,7 +2651,8 @@ def build_recording_embed(nagrywka):
         title=f"🎬 {recording_display_name(nagrywka).upper()}",
         description=(
             "### 📢 Nowy termin został zaplanowany!\n"
-            "Sprawdź szczegóły i kliknij reakcję ✅, aby potwierdzić swój udział."
+            "Kliknij reakcję ✅, aby potwierdzić udział. "
+            "Jeśli będziesz później, wybierz przycisk **Spóźnię się**."
         ),
         color=discord.Color.blurple()
     )
@@ -2452,7 +2671,7 @@ def build_recording_embed(nagrywka):
     if bot.user:
         embed.set_thumbnail(url=bot.user.display_avatar.url)
     message_id = nagrywka.get("message_id")
-    footer = "NegativE* • Reakcja ✅ oznacza potwierdzenie udziału"
+    footer = "NegativE* • ✅ obecność • ⏰ zgłoszenie spóźnienia"
     if message_id:
         footer += f" • ID: {message_id}"
     embed.set_footer(text=footer)
@@ -2587,12 +2806,21 @@ async def refresh_active_recording_messages():
                             continue
                         confirmed_ids.append(user.id)
 
-                confirmed_ids = list(dict.fromkeys(confirmed_ids))
+                late_ids = await get_single_late_user_ids(message_id)
+                confirmed_ids = list(dict.fromkeys(
+                    confirmed_ids + [
+                        user_id for user_id in late_ids
+                        if user_id not in absent_user_ids
+                    ]
+                ))
                 if set(confirmed_ids) != set(nagrywka.get("uczestnicy", [])):
                     nagrywka["uczestnicy"] = confirmed_ids
                     recordings_changed = True
 
-                await message.edit(embed=build_recording_embed(nagrywka))
+                await message.edit(
+                    embed=build_recording_embed(nagrywka),
+                    view=SingleRecordingAttendanceView(int(message_id))
+                )
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
                 print(f"❌ Nie udało się odświeżyć terminu nagrywki {message_id}: {error}")
 
@@ -2762,7 +2990,13 @@ async def sync_recording_reactions():
 
                     participant_ids.append(reacting_user.id)
 
-            participant_ids = list(dict.fromkeys(participant_ids))
+            late_ids = await get_single_late_user_ids(message_id)
+            participant_ids = list(dict.fromkeys(
+                participant_ids + [
+                    user_id for user_id in late_ids
+                    if user_id not in absent_user_ids
+                ]
+            ))
             if set(participant_ids) == set(nagrywka.get("uczestnicy", [])):
                 continue
 
@@ -3902,6 +4136,11 @@ async def nagrywka(
     }
     save_recordings(nagrywki)
 
+    await message.edit(
+        embed=build_recording_embed(nagrywki[str(message.id)]),
+        view=SingleRecordingAttendanceView(message.id)
+    )
+
     await asyncio.to_thread(
         recording_locks_collection.update_one,
         {"_id": "active_recording"},
@@ -4394,6 +4633,15 @@ async def check_recordings():
             try:
                 recording_message = await recording_channel.fetch_message(int(message_id))
                 reaction_participants = []
+                absence_authors_by_forum = await collect_absence_authors(
+                    await find_recording_forum_threads(nagrywka),
+                    nagrywka
+                )
+                absent_user_ids = {
+                    user_id
+                    for authors in absence_authors_by_forum.values()
+                    for user_id in authors
+                }
 
                 for reaction in recording_message.reactions:
                     if str(reaction.emoji) != "✅":
@@ -4409,12 +4657,24 @@ async def check_recordings():
                         ):
                             continue
 
+                        if reacting_user.id in absent_user_ids:
+                            continue
+
                         reaction_participants.append(reacting_user.id)
 
-                reaction_participants = list(dict.fromkeys(reaction_participants))
+                late_ids = await get_single_late_user_ids(message_id)
+                reaction_participants = list(dict.fromkeys(
+                    reaction_participants + [
+                        user_id for user_id in late_ids
+                        if user_id not in absent_user_ids
+                    ]
+                ))
                 if set(reaction_participants) != set(nagrywka.get("uczestnicy", [])):
                     nagrywka["uczestnicy"] = reaction_participants
-                    await recording_message.edit(embed=build_recording_embed(nagrywka))
+                    await recording_message.edit(
+                        embed=build_recording_embed(nagrywka),
+                        view=SingleRecordingAttendanceView(int(message_id))
+                    )
                     changed = True
                     print(
                         f"✅ Zsynchronizowano reakcje nagrywki {message_id}: "
@@ -5622,6 +5882,13 @@ async def usunobecnosc(
         return
 
     nagrywka["uczestnicy"].remove(user.id)
+    await asyncio.to_thread(
+        single_recording_lateness_collection.delete_many,
+        {
+            "recording_message_id": int(message_id),
+            "user_id": {"$in": [int(user.id), str(user.id)]}
+        }
+    )
     await asyncio.to_thread(save_recordings, nagrywki)
 
     channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
@@ -6759,6 +7026,7 @@ def day_member_poll_embed(poll, guild):
         name="⚖️ Zasady głosowania",
         value=(
             "• Każda osoba ma **jeden głos**.\n"
+            "• Głosować mogą wyłącznie osoby **obecne na tej nagrywce**.\n"
             "• Oddanego głosu **nie można zmienić**.\n"
             "• **Nie można głosować na samego siebie.**\n"
             "• Wyniki pozostają ukryte do końca głosowania."
@@ -6800,6 +7068,20 @@ class DayMemberVoteSelect(Select):
         )
         if not poll:
             await send_response(interaction, "❌ To głosowanie jest już zakończone.", ephemeral=True)
+            return
+
+        eligible_voter_ids = {
+            int(user_id)
+            for user_id in poll.get(
+                "eligible_voter_ids", poll.get("candidate_ids", [])
+            )
+        }
+        if interaction.user.id not in eligible_voter_ids:
+            await send_response(
+                interaction,
+                "❌ Głosować mogą wyłącznie osoby obecne na tej nagrywce.",
+                ephemeral=True
+            )
             return
 
         if str(interaction.user.id) in poll.get("votes", {}):
@@ -6869,10 +7151,18 @@ async def close_day_member_poll(poll_id, closed_by=None):
         return False
 
     votes = poll.get("votes", {})
+    eligible_voter_ids = {
+        int(user_id)
+        for user_id in poll.get("eligible_voter_ids", poll.get("candidate_ids", []))
+    }
     counts = {int(user_id): 0 for user_id in poll.get("candidate_ids", [])}
     for voter_id, candidate_id in votes.items():
         candidate_id = int(candidate_id)
-        if candidate_id in counts and int(voter_id) != candidate_id:
+        if (
+            int(voter_id) in eligible_voter_ids
+            and candidate_id in counts
+            and int(voter_id) != candidate_id
+        ):
             counts[candidate_id] += 1
 
     highest = max(counts.values(), default=0)
@@ -7063,6 +7353,12 @@ class DayMemberRecordingSelect(Select):
             return
 
         poll_id = f"{interaction.guild.id}-{int(now.timestamp() * 1000000)}"
+        eligible_voter_ids = []
+        for user_id in document.get("confirmed_ids", []):
+            member = interaction.guild.get_member(int(user_id))
+            if member and not member.bot:
+                eligible_voter_ids.append(member.id)
+        eligible_voter_ids = list(dict.fromkeys(eligible_voter_ids))
         poll = {
             "poll_id": poll_id,
             "guild_id": interaction.guild.id,
@@ -7073,6 +7369,7 @@ class DayMemberRecordingSelect(Select):
             "recording_data": document.get("data", "brak daty"),
             "recording_godzina": document.get("godzina", "brak godziny"),
             "candidate_ids": candidates,
+            "eligible_voter_ids": eligible_voter_ids,
             "candidate_names": {
                 str(user_id): interaction.guild.get_member(user_id).display_name
                 for user_id in candidates
