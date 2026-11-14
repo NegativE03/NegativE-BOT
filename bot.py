@@ -825,9 +825,9 @@ def build_gta_vi_countdown_embed(now=None):
             color=0xF04AA2,
             timestamp=now
         )
-        embed.add_field(name="📅 Dni", value=f"## **{days}**", inline=True)
-        embed.add_field(name="🕒 Godziny", value=f"## **{hours:02d}**", inline=True)
-        embed.add_field(name="⏱️ Minuty", value=f"## **{minutes:02d}**", inline=True)
+        embed.add_field(name="📅 Dni", value=f"**{days}**", inline=True)
+        embed.add_field(name="🕒 Godziny", value=f"**{hours:02d}**", inline=True)
+        embed.add_field(name="⏱️ Minuty", value=f"**{minutes:02d}**", inline=True)
         embed.add_field(
             name="🎮 Oficjalna premiera",
             value=(
