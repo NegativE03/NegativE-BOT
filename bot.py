@@ -39,6 +39,7 @@ recording_absences_collection = db["recording_absences"]
 recording_attendance_choices_collection = db["recording_attendance_choices"]
 recording_lateness_reports_collection = db["recording_lateness_reports"]
 single_recording_lateness_collection = db["single_recording_lateness"]
+single_late_cancel_requests_collection = db["single_late_cancel_requests"]
 bot_state_collection = db["bot_state"]
 
 from pymongo.errors import DuplicateKeyError, PyMongoError
@@ -124,6 +125,7 @@ async def setup_hook():
     await restore_day_member_poll_views()
     await restore_double_absence_views()
     await restore_double_attendance_views()
+    await restore_single_late_cancel_views()
     bot.add_view(PersonalStatsView())
 
 
@@ -154,6 +156,9 @@ async def on_ready():
 
     if not update_server_status.is_running():
         update_server_status.start()
+
+    if not update_gta_vi_countdown.is_running():
+        update_gta_vi_countdown.start()
 
     if not check_recordings.is_running():
         check_recordings.start()
@@ -417,6 +422,11 @@ STAFF_ROLES = [
 STATUS_CHANNEL_ID = 1513930933525413959
 STATUS_MESSAGE_ID = None
 STATUS_PANEL_STATE_ID = "kaciej_arcade_status_panel"
+
+GTA_VI_COUNTDOWN_CHANNEL_ID = 1571261349785505873
+GTA_VI_COUNTDOWN_STATE_ID = "gta_vi_release_countdown"
+GTA_VI_RELEASE_AT = datetime(2026, 11, 19, 0, 0, tzinfo=ZoneInfo("Europe/Warsaw"))
+GTA_VI_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "gta_vi_logo.png")
 BOT_REMOVING_ABSENCE_MESSAGE_IDS = set()
 
 class TicketModal(Modal, title="Nowe zgłoszenie"):
@@ -795,6 +805,125 @@ async def update_server_status_error(error):
 
     asyncio.create_task(restart_status_loop())
 
+
+def build_gta_vi_countdown_embed(now=None):
+    now = now or datetime.now(ZoneInfo("Europe/Warsaw"))
+    release_timestamp = int(GTA_VI_RELEASE_AT.timestamp())
+    remaining_seconds = max(0, int((GTA_VI_RELEASE_AT - now).total_seconds()))
+    days, remainder = divmod(remaining_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if remaining_seconds > 0:
+        embed = discord.Embed(
+            title="🌴 GRAND THEFT AUTO VI",
+            description=(
+                "## 🔥 Odliczanie do premiery\n"
+                "Vice City czeka. Do jednej z najbardziej wyczekiwanych premier "
+                "zostało coraz mniej czasu."
+            ),
+            color=0xF04AA2,
+            timestamp=now
+        )
+        embed.add_field(name="📅 Dni", value=f"## **{days}**", inline=True)
+        embed.add_field(name="🕒 Godziny", value=f"## **{hours:02d}**", inline=True)
+        embed.add_field(name="⏱️ Minuty", value=f"## **{minutes:02d}**", inline=True)
+        embed.add_field(
+            name="🎮 Oficjalna premiera",
+            value=(
+                f"**19 listopada 2026 • 00:00**\n"
+                f"🇵🇱 Strefa czasowa: **Europe/Warsaw**\n"
+                f"Premiera <t:{release_timestamp}:R>"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="⚡ Dokładne odliczanie",
+            value=f"**{days} dni • {hours:02d} godz. • {minutes:02d} min • {seconds:02d} sek.**",
+            inline=False
+        )
+        embed.set_footer(text="GTA VI • Odliczanie aktualizowane automatycznie")
+    else:
+        embed = discord.Embed(
+            title="🌴 GRAND THEFT AUTO VI",
+            description=(
+                "## 🎉 GTA VI JUŻ JEST!\n"
+                "Odliczanie dobiegło końca. Czas wrócić do Vice City!"
+            ),
+            color=0x9B59FF,
+            timestamp=now
+        )
+        embed.add_field(
+            name="🎮 Premiera",
+            value=f"Nastąpiła <t:{release_timestamp}:R> • <t:{release_timestamp}:F>",
+            inline=False
+        )
+        embed.set_footer(text="GTA VI • Miłej gry!")
+
+    embed.set_image(url="attachment://gta_vi_logo.png")
+    return embed
+
+
+@tasks.loop(minutes=1)
+async def update_gta_vi_countdown():
+    channel = bot.get_channel(GTA_VI_COUNTDOWN_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(GTA_VI_COUNTDOWN_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Nie udało się pobrać kanału licznika GTA VI: {error}")
+            return
+
+    state = await asyncio.to_thread(
+        bot_state_collection.find_one,
+        {"_id": GTA_VI_COUNTDOWN_STATE_ID}
+    )
+    message = None
+    if state and state.get("message_id"):
+        try:
+            message = await channel.fetch_message(int(state["message_id"]))
+        except discord.NotFound:
+            message = None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Nie udało się pobrać licznika GTA VI: {error}")
+            return
+
+    embed = build_gta_vi_countdown_embed()
+    try:
+        if message is None:
+            file = discord.File(GTA_VI_LOGO_PATH, filename="gta_vi_logo.png")
+            message = await channel.send(embed=embed, file=file)
+        else:
+            await message.edit(embed=embed)
+    except (OSError, discord.Forbidden, discord.HTTPException) as error:
+        print(f"❌ Nie udało się zaktualizować licznika GTA VI: {error}")
+        return
+
+    await asyncio.to_thread(
+        bot_state_collection.update_one,
+        {"_id": GTA_VI_COUNTDOWN_STATE_ID},
+        {"$set": {
+            "channel_id": channel.id,
+            "message_id": message.id,
+            "release_at": GTA_VI_RELEASE_AT.isoformat(),
+            "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+        }},
+        upsert=True
+    )
+
+
+@update_gta_vi_countdown.before_loop
+async def before_update_gta_vi_countdown():
+    await bot.wait_until_ready()
+
+
+@update_gta_vi_countdown.error
+async def update_gta_vi_countdown_error(error):
+    print(
+        "❌ Pętla licznika GTA VI zatrzymała się: "
+        f"{type(error).__name__}: {error}"
+    )
+
 # Logi wiadomości
 MESSAGE_LOGS_CHANNEL_ID = 1513882214188978288
 
@@ -1091,6 +1220,34 @@ async def on_raw_reaction_add(payload):
                     member
                 )
 
+                return
+
+            late_record = await asyncio.to_thread(
+                single_recording_lateness_collection.find_one,
+                {
+                    "recording_message_id": int(payload.message_id),
+                    "user_id": int(payload.user_id)
+                }
+            )
+            if late_record is not None:
+                reaction_user = member
+                if reaction_user is None:
+                    try:
+                        reaction_user = await bot.fetch_user(payload.user_id)
+                    except (discord.NotFound, discord.HTTPException):
+                        reaction_user = None
+                if reaction_user is not None:
+                    try:
+                        await message.remove_reaction("✅", reaction_user)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+                    try:
+                        await reaction_user.send(
+                            "⏰ Masz już zapisane spóźnienie na tę nagrywkę, "
+                            "dlatego nie możesz dodatkowo potwierdzić obecności reakcją ✅."
+                        )
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
                 return
 
             absence_authors_by_forum = await collect_absence_authors(
@@ -2574,6 +2731,10 @@ class SingleRecordingLateModal(Modal, title="Zgłoszenie spóźnienia"):
         if channel is not None:
             try:
                 message = await channel.fetch_message(self.recording_message_id)
+                try:
+                    await message.remove_reaction("✅", interaction.user)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
                 await message.edit(
                     embed=build_recording_embed(nagrywka),
                     view=SingleRecordingAttendanceView(self.recording_message_id)
@@ -2626,8 +2787,318 @@ class SingleRecordingLateButton(Button):
         self.recording_message_id = int(recording_message_id)
 
     async def callback(self, interaction: discord.Interaction):
+        existing = await asyncio.to_thread(
+            single_recording_lateness_collection.find_one,
+            {
+                "recording_message_id": self.recording_message_id,
+                "user_id": interaction.user.id
+            }
+        )
+        if existing is not None:
+            await interaction.response.send_message(
+                "⏰ Masz już zgłoszone spóźnienie. Użyj przycisku **Cofnij spóźnienie**.",
+                ephemeral=True
+            )
+            return
         await interaction.response.send_modal(
             SingleRecordingLateModal(self.recording_message_id)
+        )
+
+
+class SingleLateCancelModal(Modal, title="Prośba o cofnięcie spóźnienia"):
+    explanation = TextInput(
+        label="Wyjaśnienie (opcjonalne)",
+        placeholder="Np. jednak zdążę na czas...",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=500
+    )
+
+    def __init__(self, recording_message_id):
+        super().__init__()
+        self.recording_message_id = int(recording_message_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        late_record = await asyncio.to_thread(
+            single_recording_lateness_collection.find_one,
+            {
+                "recording_message_id": self.recording_message_id,
+                "user_id": interaction.user.id
+            }
+        )
+        if late_record is None:
+            await interaction.edit_original_response(
+                content="❌ Nie masz aktywnego zgłoszenia spóźnienia na tę nagrywkę."
+            )
+            return
+
+        pending = await asyncio.to_thread(
+            single_late_cancel_requests_collection.find_one,
+            {
+                "recording_message_id": self.recording_message_id,
+                "user_id": interaction.user.id,
+                "status": "pending"
+            }
+        )
+        if pending is not None:
+            await interaction.edit_original_response(
+                content="⏳ Twoja prośba o cofnięcie spóźnienia już czeka na decyzję administracji."
+            )
+            return
+
+        nagrywka = await asyncio.to_thread(
+            recordings_collection.find_one,
+            {"message_id": self.recording_message_id}
+        )
+        if nagrywka is None:
+            await interaction.edit_original_response(content="❌ Ta nagrywka nie jest już aktywna.")
+            return
+
+        request_id = f"late-cancel-{interaction.user.id}-{int(datetime.now(ZoneInfo('Europe/Warsaw')).timestamp() * 1000000)}"
+        request_document = {
+            "request_id": request_id,
+            "recording_message_id": self.recording_message_id,
+            "user_id": interaction.user.id,
+            "user_name": interaction.user.display_name,
+            "explanation": str(self.explanation).strip() or None,
+            "status": "pending",
+            "created_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat(),
+            "channel_id": REPORT_CHANNEL_ID,
+            "message_id": None
+        }
+        await asyncio.to_thread(
+            single_late_cancel_requests_collection.insert_one,
+            request_document
+        )
+
+        report_channel = bot.get_channel(REPORT_CHANNEL_ID)
+        if report_channel is None:
+            try:
+                report_channel = await bot.fetch_channel(REPORT_CHANNEL_ID)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                report_channel = None
+        if report_channel is None:
+            await asyncio.to_thread(
+                single_late_cancel_requests_collection.delete_one,
+                {"request_id": request_id}
+            )
+            await interaction.edit_original_response(content="❌ Nie znaleziono kanału raportów.")
+            return
+
+        announcement_url = (
+            f"https://discord.com/channels/{GUILD_ID}/{NAGRYWKI_CHANNEL_ID}/"
+            f"{self.recording_message_id}"
+        )
+        embed = discord.Embed(
+            title="↩️ Prośba o cofnięcie spóźnienia",
+            description=(
+                f"{interaction.user.mention} prosi o anulowanie zgłoszonego spóźnienia."
+            ),
+            color=discord.Color.orange(),
+            timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+        )
+        embed.add_field(
+            name="🎬 Nagrywka",
+            value=f"**{recording_display_name(nagrywka)}**\n📅 {nagrywka['data']} • 🕒 {nagrywka['godzina']}",
+            inline=False
+        )
+        embed.add_field(
+            name="📝 Wyjaśnienie",
+            value=request_document["explanation"] or "*Nie podano wyjaśnienia.*",
+            inline=False
+        )
+        embed.add_field(
+            name="🔗 Termin",
+            value=f"[Przejdź do nagrywki]({announcement_url})",
+            inline=False
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text=f"ID użytkownika: {interaction.user.id}")
+        admin_role_ids = STAFF_ROLES[:3]
+        content = " ".join(f"<@&{role_id}>" for role_id in admin_role_ids)
+        try:
+            request_message = await report_channel.send(
+                content=content,
+                embed=embed,
+                view=SingleLateCancelDecisionView(request_id),
+                allowed_mentions=discord.AllowedMentions(
+                    roles=True, users=False, everyone=False
+                )
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await asyncio.to_thread(
+                single_late_cancel_requests_collection.delete_one,
+                {"request_id": request_id}
+            )
+            await interaction.edit_original_response(
+                content="❌ Nie udało się wysłać prośby do administracji."
+            )
+            return
+        await asyncio.to_thread(
+            single_late_cancel_requests_collection.update_one,
+            {"request_id": request_id},
+            {"$set": {"message_id": request_message.id}}
+        )
+        await interaction.edit_original_response(
+            content="✅ Prośba o cofnięcie spóźnienia została wysłana do administracji."
+        )
+
+
+class SingleLateCancelButton(Button):
+    def __init__(self, recording_message_id):
+        super().__init__(
+            label="Cofnij spóźnienie",
+            emoji="↩️",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"single_late_cancel:{recording_message_id}"
+        )
+        self.recording_message_id = int(recording_message_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            SingleLateCancelModal(self.recording_message_id)
+        )
+
+
+class SingleLateCancelDecisionView(View):
+    def __init__(self, request_id):
+        super().__init__(timeout=None)
+        self.request_id = request_id
+
+        approve = Button(
+            label="Zaakceptuj cofnięcie",
+            emoji="✅",
+            style=discord.ButtonStyle.success,
+            custom_id=f"late_cancel_approve:{request_id}"
+        )
+        reject = Button(
+            label="Odrzuć",
+            emoji="❌",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"late_cancel_reject:{request_id}"
+        )
+        approve.callback = self.approve_callback
+        reject.callback = self.reject_callback
+        self.add_item(approve)
+        self.add_item(reject)
+
+    async def process(self, interaction, decision):
+        allowed_admin_roles = set(STAFF_ROLES[:3])
+        if not any(role.id in allowed_admin_roles for role in interaction.user.roles):
+            await interaction.response.send_message(
+                "❌ Decyzję może podjąć Kaciej, Opiekun Ekipy lub Administrator.",
+                ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        request_document = await asyncio.to_thread(
+            single_late_cancel_requests_collection.find_one_and_update,
+            {"request_id": self.request_id, "status": "pending"},
+            {"$set": {
+                "status": decision,
+                "decided_by": interaction.user.id,
+                "decided_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+            }},
+            return_document=ReturnDocument.AFTER
+        )
+        if request_document is None:
+            await interaction.edit_original_response(content="❌ Ta prośba została już rozpatrzona.")
+            return
+
+        user_id = int(request_document["user_id"])
+        recording_message_id = int(request_document["recording_message_id"])
+        nagrywka = await asyncio.to_thread(
+            recordings_collection.find_one,
+            {"message_id": recording_message_id}
+        )
+        if decision == "approved":
+            await asyncio.to_thread(
+                single_recording_lateness_collection.delete_many,
+                {"recording_message_id": recording_message_id, "user_id": user_id}
+            )
+            if nagrywka is not None:
+                await asyncio.to_thread(
+                    recordings_collection.update_one,
+                    {"_id": nagrywka["_id"]},
+                    {"$pull": {"uczestnicy": {"$in": [user_id, str(user_id)]}}}
+                )
+                nagrywka["uczestnicy"] = [
+                    int(value) for value in nagrywka.get("uczestnicy", [])
+                    if int(value) != user_id
+                ]
+                channel = bot.get_channel(NAGRYWKI_CHANNEL_ID)
+                if channel is not None:
+                    try:
+                        recording_message = await channel.fetch_message(recording_message_id)
+                        await recording_message.edit(
+                            embed=build_recording_embed(nagrywka),
+                            view=SingleRecordingAttendanceView(recording_message_id)
+                        )
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+                await update_single_lateness_report(nagrywka)
+
+        result_embed = discord.Embed(
+            title=(
+                "✅ Cofnięcie spóźnienia zaakceptowane"
+                if decision == "approved" else
+                "❌ Cofnięcie spóźnienia odrzucone"
+            ),
+            description=(
+                f"Wniosek <@{user_id}> został rozpatrzony przez {interaction.user.mention}."
+            ),
+            color=(
+                discord.Color.green()
+                if decision == "approved" else discord.Color.red()
+            ),
+            timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+        )
+        result_embed.add_field(
+            name="📝 Wyjaśnienie użytkownika",
+            value=request_document.get("explanation") or "*Nie podano.*",
+            inline=False
+        )
+        if decision == "approved":
+            result_embed.add_field(
+                name="ℹ️ Co dalej?",
+                value="Spóźnienie usunięto. Użytkownik musi kliknąć ✅, jeśli będzie na czas.",
+                inline=False
+            )
+        await interaction.message.edit(content=None, embed=result_embed, view=None)
+
+        try:
+            target_user = await bot.fetch_user(user_id)
+            await target_user.send(
+                (
+                    "✅ Administracja zaakceptowała cofnięcie Twojego spóźnienia. "
+                    "Kliknij ✅ pod terminem, jeśli będziesz na czas."
+                    if decision == "approved" else
+                    "❌ Administracja odrzuciła prośbę o cofnięcie Twojego spóźnienia."
+                )
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+        await interaction.edit_original_response(content="✅ Decyzja została zapisana.")
+
+    async def approve_callback(self, interaction):
+        await self.process(interaction, "approved")
+
+    async def reject_callback(self, interaction):
+        await self.process(interaction, "rejected")
+
+
+async def restore_single_late_cancel_views():
+    pending_requests = await asyncio.to_thread(
+        lambda: list(single_late_cancel_requests_collection.find({
+            "status": "pending",
+            "message_id": {"$ne": None}
+        }))
+    )
+    for request_document in pending_requests:
+        bot.add_view(
+            SingleLateCancelDecisionView(request_document["request_id"]),
+            message_id=int(request_document["message_id"])
         )
 
 
@@ -2635,6 +3106,7 @@ class SingleRecordingAttendanceView(View):
     def __init__(self, recording_message_id):
         super().__init__(timeout=None)
         self.add_item(SingleRecordingLateButton(recording_message_id))
+        self.add_item(SingleLateCancelButton(recording_message_id))
 
 
 def build_recording_embed(nagrywka):
@@ -2652,7 +3124,8 @@ def build_recording_embed(nagrywka):
         description=(
             "### 📢 Nowy termin został zaplanowany!\n"
             "Kliknij reakcję ✅, aby potwierdzić udział. "
-            "Jeśli będziesz później, wybierz przycisk **Spóźnię się**."
+            "Jeśli będziesz później, wybierz **Spóźnię się**. "
+            "Zmianę zgłoszenia wyślesz przez **Cofnij spóźnienie**."
         ),
         color=discord.Color.blurple()
     )
