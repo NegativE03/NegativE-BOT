@@ -816,33 +816,47 @@ def build_gta_vi_countdown_embed(now=None):
 
     if remaining_seconds > 0:
         embed = discord.Embed(
-            title="🌴 GRAND THEFT AUTO VI",
+            title="🌴✨ GTA VI • WIELKIE ODLICZANIE ✨🌴",
             description=(
-                "## 🔥 Odliczanie do premiery\n"
-                "Vice City czeka. Do jednej z najbardziej wyczekiwanych premier "
-                "zostało coraz mniej czasu."
+                "## 🔥 VICE CITY CORAZ BLIŻEJ\n"
+                "> Słońce, neonowe ulice i największy powrót w historii gier.\n"
+                "> **Odliczamy każdą chwilę do premiery Grand Theft Auto VI.**\n\n"
+                "━━━━━━━━━━━━━━━━━━━━"
             ),
             color=0xF04AA2,
             timestamp=now
         )
-        embed.add_field(name="📅 Dni", value=f"**{days}**", inline=True)
-        embed.add_field(name="🕒 Godziny", value=f"**{hours:02d}**", inline=True)
-        embed.add_field(name="⏱️ Minuty", value=f"**{minutes:02d}**", inline=True)
+        if remaining_seconds >= 3600:
+            embed.add_field(name="📅 DNI", value=f"`  {days}  `", inline=True)
+            embed.add_field(name="🕒 GODZINY", value=f"`  {hours:02d}  `", inline=True)
+            embed.add_field(name="⏱️ MINUTY", value=f"`  {minutes:02d}  `", inline=True)
+            countdown_value = f"**{days} dni  •  {hours:02d} godz.  •  {minutes:02d} min**"
+        else:
+            embed.add_field(name="⏱️ MINUTY", value=f"`  {minutes:02d}  `", inline=True)
+            embed.add_field(name="⚡ SEKUNDY", value=f"`  {seconds:02d}  `", inline=True)
+            embed.add_field(name="🚨 TRYB FINAŁOWY", value="**JUŻ ZA CHWILĘ!**", inline=True)
+            countdown_value = f"**{minutes:02d} min  •  {seconds:02d} sek.**"
         embed.add_field(
-            name="🎮 Oficjalna premiera",
+            name="🎮 OFICJALNA PREMIERA",
             value=(
                 f"**19 listopada 2026 • 00:00**\n"
-                f"🇵🇱 Strefa czasowa: **Europe/Warsaw**\n"
-                f"Premiera <t:{release_timestamp}:R>"
+                f"🇵🇱 Czas polski • **Europe/Warsaw**\n"
+                f"🚀 Start <t:{release_timestamp}:R>"
             ),
             inline=False
         )
         embed.add_field(
-            name="⚡ Dokładne odliczanie",
-            value=f"**{days} dni • {hours:02d} godz. • {minutes:02d} min • {seconds:02d} sek.**",
+            name="🔥 DO PREMIERY POZOSTAŁO",
+            value=countdown_value,
             inline=False
         )
-        embed.set_footer(text="GTA VI • Odliczanie aktualizowane automatycznie")
+        updated_timestamp = int(now.timestamp())
+        embed.add_field(
+            name="🔄 OSTATNIA AKTUALIZACJA LICZNIKA",
+            value=f"<t:{updated_timestamp}:R> • <t:{updated_timestamp}:T>",
+            inline=False
+        )
+        embed.set_footer(text="GTA VI • Następna aktualizacja za maksymalnie minutę")
     else:
         embed = discord.Embed(
             title="🌴 GRAND THEFT AUTO VI",
