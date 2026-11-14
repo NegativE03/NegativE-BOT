@@ -820,8 +820,7 @@ def build_gta_vi_countdown_embed(now=None):
             description=(
                 "## 🔥 VICE CITY CORAZ BLIŻEJ\n"
                 "> Słońce, neonowe ulice i największy powrót w historii gier.\n"
-                "> **Odliczamy każdą chwilę do premiery Grand Theft Auto VI.**\n\n"
-                "━━━━━━━━━━━━━━━━━━━━"
+                "> **Odliczamy każdą chwilę do premiery Grand Theft Auto VI.**"
             ),
             color=0xF04AA2,
             timestamp=now
