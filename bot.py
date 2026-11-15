@@ -148,11 +148,8 @@ async def on_ready():
 
     print(f"Zalogowano jako {bot.user}")
 
-    await bot.change_presence(
-        activity=discord.Game(
-            name="KACIEJOS - SERWER NAGRYWKOWY"
-        )
-    )
+    if not rotate_bot_presence.is_running():
+        rotate_bot_presence.start()
 
     if not update_server_status.is_running():
         update_server_status.start()
@@ -427,6 +424,7 @@ GTA_VI_COUNTDOWN_CHANNEL_ID = 1571261349785505873
 GTA_VI_COUNTDOWN_STATE_ID = "gta_vi_release_countdown"
 GTA_VI_RELEASE_AT = datetime(2026, 11, 19, 0, 0, tzinfo=ZoneInfo("Europe/Warsaw"))
 GTA_VI_LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "gta_vi_logo.png")
+PRESENCE_ROTATION_INDEX = 0
 BOT_REMOVING_ABSENCE_MESSAGE_IDS = set()
 
 class TicketModal(Modal, title="Nowe zgłoszenie"):
@@ -875,6 +873,39 @@ def build_gta_vi_countdown_embed(now=None):
 
     embed.set_image(url="attachment://gta_vi_logo.png")
     return embed
+
+
+def get_gta_vi_presence_text():
+    now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    remaining_seconds = int((GTA_VI_RELEASE_AT - now).total_seconds())
+    if remaining_seconds <= 0:
+        return "GTA VI JUŻ JEST!"
+
+    remaining_days = max(1, (remaining_seconds + 86399) // 86400)
+    day_word = "DZIEŃ" if remaining_days == 1 else "DNI"
+    return f"GTA VI ZA {remaining_days} {day_word}"
+
+
+@tasks.loop(minutes=2)
+async def rotate_bot_presence():
+    global PRESENCE_ROTATION_INDEX
+    activities = (
+        "KACIEJOS - SERWER NAGRYWKOWY",
+        get_gta_vi_presence_text()
+    )
+    activity_name = activities[PRESENCE_ROTATION_INDEX % len(activities)]
+    PRESENCE_ROTATION_INDEX += 1
+
+    try:
+        await bot.change_presence(activity=discord.Game(name=activity_name))
+        print(f"🎮 Zmieniono aktywność bota: {activity_name}")
+    except discord.HTTPException as error:
+        print(f"❌ Nie udało się zmienić aktywności bota: {error}")
+
+
+@rotate_bot_presence.before_loop
+async def before_rotate_bot_presence():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(minutes=1)
