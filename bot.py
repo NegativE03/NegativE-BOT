@@ -112,7 +112,86 @@ async def defer_slow_interaction(interaction: discord.Interaction):
         pass
     return True
 
-bot.tree.interaction_check = defer_slow_interaction
+def is_gta_vi_waiting_member(interaction: discord.Interaction):
+    if interaction.user.id == BOSS_USER_ID:
+        return False
+    return any(
+        role.id == GTA_VI_ROLE_ID
+        for role in getattr(interaction.user, "roles", [])
+    )
+
+
+def build_gta_vi_waiting_embed():
+    embed = discord.Embed(
+        title="🌴 Vice City jeszcze przed nami",
+        description=(
+            "## ⏳ Obecnie oczekujemy na kolejny etap\n"
+            "Ten rozdział został na chwilę zamknięty. Teraz jest czas dla Ciebie - "
+            "skup się na sobie, rozwijaj swoje życie, pasje i własne plany."
+        ),
+        color=0xF04AA2,
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    embed.add_field(
+        name="💜 TO TYLKO PRZERWA",
+        value=(
+            "Wspólna historia jeszcze się nie kończy. Po prostu czekamy na moment, "
+            "w którym będziemy mogli rozpocząć jej następny rozdział."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🌆 CO DALEJ?",
+        value=(
+            "W niedalekiej przyszłości obyśmy ponownie usłyszeli się "
+            "**w tym samym składzie - już w Vice City.**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="✨ DO TEGO CZASU",
+        value="Dbaj o siebie, spełniaj swoje cele i nie przestawaj rozwijać pasji.",
+        inline=False
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="NegativE* • Do zobaczenia w Vice City")
+    return embed
+
+
+async def gta_vi_app_command_check(interaction: discord.Interaction):
+    if is_gta_vi_waiting_member(interaction):
+        await send_response(
+            interaction,
+            embed=build_gta_vi_waiting_embed(),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        return False
+    return await defer_slow_interaction(interaction)
+
+
+async def gta_vi_component_check(self, interaction: discord.Interaction):
+    if is_gta_vi_waiting_member(interaction):
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                embed=build_gta_vi_waiting_embed(),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        else:
+            await interaction.response.send_message(
+                embed=build_gta_vi_waiting_embed(),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+        return False
+    return True
+
+
+bot.tree.interaction_check = gta_vi_app_command_check
+View.interaction_check = gta_vi_component_check
+Modal.interaction_check = gta_vi_component_check
 
 @bot.event
 async def setup_hook():
@@ -1774,8 +1853,28 @@ REPORT_CHANNEL_ID = 1543600442766794753
 PERSONAL_STATS_CHANNEL_ID = 1504927664635646104
 NAGRYWKOWICZE_ROLE_ID = 1504910374963511316
 TESTOWI_ROLE_ID = 1504911316173717625
+GTA_VI_ROLE_ID = 1571260690084405288
+FRIEND_ROLE_ID = 1504935639966023910
 BOSS_USER_ID = 308263498226597888
 KACIEJ_USER_ID = 1042829196747091988
+GTA_VI_FAREWELL_EXCEPTIONS = {
+    432268399603744771: "Astra",
+    418512287234523148: "Wilku",
+    724550769231134830: "Cielok",
+    356833167065481218: "Kapisz",
+    344565233366466560: "Jano",
+    760395887620128809: "czoko",
+    802949803545198643: "czajek",
+    1160928857478680707: "kierownik",
+    688830294735847452: "ikea",
+    873235776949850162: "lipsonek",
+    653944835740270592: "szavek",
+    862785469670621265: "kinga",
+    664469607284736003: "kamorti",
+    401802193595793448: "taranek",
+    498560790714908702: "karmol",
+    565784186808434699: "dwu"
+}
 MIN_VC_ATTENDANCE_SECONDS = 35 * 60
 POLISH_WEEKDAYS = (
     "poniedziałek",
@@ -8047,6 +8146,231 @@ async def topnagrywkowiczdnia(interaction: discord.Interaction):
         embed=embed,
         allowed_mentions=discord.AllowedMentions.none()
     )
+
+def build_gta_vi_farewell_embed(include_gta_v_history=False):
+    embed = discord.Embed(
+        title="🌴 DZIĘKUJEMY ZA WSPÓLNĄ DROGĘ",
+        description=(
+            "## 💜 To nie koniec - to początek nowego rozdziału\n"
+            "Dziękujemy Ci za współtworzenie kawałka tej ekipy. "
+            "Za każdą nagrywkę, pomoc, poświęcony czas i wszystkie wspólne chwile.\n\n"
+            "To dzięki takim osobom jak Ty ta ekipa mogła się rozwijać i tworzyć "
+            "rzeczy, które zostaną z nami na długo."
+        ),
+        color=0xF04AA2,
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    if include_gta_v_history:
+        embed.add_field(
+            name="🏆 13 LAT WSPÓLNEJ HISTORII",
+            value=(
+                "Dziękujemy za dołożenie własnego kawałka do historii "
+                "**Ekipy Kaciejosa w GTA V** - historii, która przez ostatnie "
+                "**13 lat** tworzyła nasze relacje."
+            ),
+            inline=False
+        )
+    embed.add_field(
+        name="🎮 NOWY ROZDZIAŁ",
+        value="Od teraz jesteś częścią ekipy **GTA VI**.",
+        inline=False
+    )
+    embed.add_field(
+        name="🌆 NASTĘPNY PRZYSTANEK",
+        value="**Widzimy się w Vice City.** 🌴✨",
+        inline=False
+    )
+    embed.add_field(
+        name="🫶 JESZCZE RAZ - DZIĘKUJEMY",
+        value="Za to, że byłeś częścią tej historii. Najlepsze dopiero przed nami!",
+        inline=False
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="NegativE* • See you in Vice City")
+    return embed
+
+
+@bot.tree.command(
+    name="premieragtavi",
+    description="Zamienia dotychczasowe role ekipy na rolę GTA VI"
+)
+async def premieragtavi(interaction: discord.Interaction):
+    if interaction.user.id != BOSS_USER_ID:
+        await send_response(
+            interaction,
+            "❌ Ta komenda jest dostępna wyłącznie dla właściciela.",
+            ephemeral=True
+        )
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await send_response(
+            interaction,
+            "❌ Tej komendy można użyć wyłącznie na serwerze.",
+            ephemeral=True
+        )
+        return
+
+    helper_role = guild.get_role(NAGRYWKOWICZE_ROLE_ID)
+    tester_role = guild.get_role(TESTOWI_ROLE_ID)
+    vacation_role = guild.get_role(URLOP_ROLE_ID)
+    friend_role = guild.get_role(FRIEND_ROLE_ID)
+    gta_vi_role = guild.get_role(GTA_VI_ROLE_ID)
+    missing_roles = [
+        name for role, name in (
+            (helper_role, "Pomocnik"),
+            (tester_role, "Testowy Pomocnik"),
+            (vacation_role, "Urlop"),
+            (friend_role, "Przyjaciel"),
+            (gta_vi_role, "GTA VI")
+        )
+        if role is None
+    ]
+    if missing_roles:
+        await send_response(
+            interaction,
+            f"❌ Nie znaleziono ról: **{', '.join(missing_roles)}**.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await guild.chunk(cache=True)
+    except (discord.ClientException, discord.HTTPException) as error:
+        print(f"⚠️ Nie udało się odświeżyć listy członków przed zmianą ról: {error}")
+
+    farewell_member_ids = {
+        member.id for member in (*helper_role.members, *tester_role.members)
+    }
+    affected_members = {
+        member.id: member
+        for member in (
+            *helper_role.members,
+            *tester_role.members,
+            *vacation_role.members,
+            *friend_role.members
+        )
+    }
+    changed_members = []
+    failed_members = []
+    farewell_sent = []
+    farewell_failed = []
+
+    for member in affected_members.values():
+        old_roles = [
+            role for role in (helper_role, tester_role, vacation_role, friend_role)
+            if role in member.roles
+        ]
+        try:
+            if gta_vi_role not in member.roles:
+                await member.add_roles(
+                    gta_vi_role,
+                    reason=f"Premiera GTA VI — zmiana wykonana przez {interaction.user}"
+                )
+            if old_roles:
+                await member.remove_roles(
+                    *old_roles,
+                    reason=f"Premiera GTA VI — zmiana wykonana przez {interaction.user}"
+                )
+            changed_members.append(member)
+        except (discord.Forbidden, discord.HTTPException) as error:
+            failed_members.append((member, str(error)))
+            print(f"❌ Nie udało się zmienić ról użytkownika {member} ({member.id}): {error}")
+
+    farewell_embed = build_gta_vi_farewell_embed()
+    regular_farewell_ids = farewell_member_ids - set(GTA_VI_FAREWELL_EXCEPTIONS)
+    for member_id in regular_farewell_ids:
+        member = affected_members.get(member_id)
+        if member is None:
+            continue
+        try:
+            await member.send(
+                embed=farewell_embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            farewell_sent.append((member.id, member.display_name))
+        except (discord.Forbidden, discord.HTTPException) as error:
+            farewell_failed.append((member.id, member.display_name, str(error)))
+            print(f"⚠️ Nie udało się wysłać pożegnania do {member} ({member.id}): {error}")
+
+    history_farewell_embed = build_gta_vi_farewell_embed(include_gta_v_history=True)
+    for user_id, saved_name in GTA_VI_FAREWELL_EXCEPTIONS.items():
+        try:
+            user = bot.get_user(user_id)
+            if user is None:
+                user = await bot.fetch_user(user_id)
+            await user.send(
+                embed=history_farewell_embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            farewell_sent.append((user_id, saved_name))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            farewell_failed.append((user_id, saved_name, str(error)))
+            print(
+                f"⚠️ Nie udało się wysłać specjalnego pożegnania do "
+                f"{saved_name} ({user_id}): {error}"
+            )
+
+    embed = discord.Embed(
+        title="🌴 Zmiana ekipy na GTA VI zakończona",
+        description=(
+            "Role **Pomocnik**, **Testowy Pomocnik**, **Urlop** i **Przyjaciel** "
+            "zostały zastąpione "
+            f"rolą {gta_vi_role.mention}."
+        ),
+        color=0xF04AA2,
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    embed.add_field(
+        name="✅ Zmieniono role",
+        value=f"**{len(changed_members)} {polish_people_word(len(changed_members))}**",
+        inline=True
+    )
+    embed.add_field(
+        name="❌ Niepowodzenia",
+        value=f"**{len(failed_members)}**",
+        inline=True
+    )
+    embed.add_field(
+        name="💌 Wiadomości PW",
+        value=(
+            f"Dostarczone: **{len(farewell_sent)}**\n"
+            f"Niedostarczone: **{len(farewell_failed)}**"
+        ),
+        inline=True
+    )
+    if failed_members:
+        failed_mentions = ", ".join(member.mention for member, _ in failed_members[:20])
+        if len(failed_members) > 20:
+            failed_mentions += f" i jeszcze {len(failed_members) - 20}"
+        embed.add_field(
+            name="⚠️ Nie udało się zmienić",
+            value=failed_mentions,
+            inline=False
+        )
+    if farewell_failed:
+        failed_dm_mentions = "\n".join(
+            f"• **{name}** (`{user_id}`)"
+            for user_id, name, _ in farewell_failed[:20]
+        )
+        if len(farewell_failed) > 20:
+            failed_dm_mentions += f"\n• i jeszcze **{len(farewell_failed) - 20}**"
+        embed.add_field(
+            name="📪 Nie dostarczono wiadomości PW",
+            value=failed_dm_mentions,
+            inline=False
+        )
+    embed.set_footer(text="Komenda dostępna wyłącznie dla właściciela")
+
+    await send_response(
+        interaction,
+        embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
 
 @bot.tree.command(
     name="praca",
