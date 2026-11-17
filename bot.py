@@ -965,6 +965,109 @@ def get_gta_vi_presence_text():
     return f"GTA VI ZA {remaining_days} {day_word}"
 
 
+def build_gta_vi_release_embed():
+    release_timestamp = int(GTA_VI_RELEASE_AT.timestamp())
+    embed = discord.Embed(
+        title="🌴🎉 GRAND THEFT AUTO VI - GLOBALNA PREMIERA",
+        description=(
+            "## 🔥 NADSZEDŁ TEN DZIEŃ\n"
+            "Po latach oczekiwania Vice City ponownie otwiera przed nami swoje "
+            "ulice. **Grand Theft Auto VI jest już dostępne!**"
+        ),
+        color=0xF04AA2,
+        timestamp=GTA_VI_RELEASE_AT
+    )
+    embed.add_field(
+        name="🎮 GTA VI JUŻ JEST",
+        value=(
+            "Odliczanie oficjalnie dobiegło końca. Czas rozpocząć zupełnie nowy "
+            "rozdział, stworzyć kolejne historie i wspomnienia."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="📅 MOMENT PREMIERY",
+        value=(
+            f"<t:{release_timestamp}:F>\n"
+            f"Premiera nastąpiła <t:{release_timestamp}:R>"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🌆 WIDZIMY SIĘ W VICE CITY",
+        value=(
+            "Neony już świecą, palmy czekają, a nowa wspólna historia właśnie "
+            "się rozpoczyna. **Do zobaczenia na ulicach Vice City!** 🌴✨"
+        ),
+        inline=False
+    )
+    embed.set_image(url="attachment://gta_vi_logo.png")
+    embed.set_footer(text="NegativE* • Welcome to Vice City")
+    return embed
+
+
+async def ensure_gta_vi_release_announcement(channel):
+    now = datetime.now(ZoneInfo("Europe/Warsaw"))
+    if now < GTA_VI_RELEASE_AT:
+        return
+
+    state = await asyncio.to_thread(
+        bot_state_collection.find_one,
+        {"_id": GTA_VI_COUNTDOWN_STATE_ID}
+    )
+    if state and state.get("release_announced"):
+        return
+
+    announcement_title = "🌴🎉 GRAND THEFT AUTO VI - GLOBALNA PREMIERA"
+    existing_announcement = None
+    try:
+        async for previous_message in channel.history(limit=100):
+            if (
+                previous_message.author == bot.user
+                and previous_message.embeds
+                and previous_message.embeds[0].title == announcement_title
+            ):
+                existing_announcement = previous_message
+                break
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"❌ Nie udało się sprawdzić ogłoszenia premiery GTA VI: {error}")
+        return
+
+    if existing_announcement is None:
+        gta_vi_role = channel.guild.get_role(GTA_VI_ROLE_ID)
+        if gta_vi_role is None:
+            print("❌ Nie znaleziono roli GTA VI do ogłoszenia premiery")
+            return
+
+        try:
+            file = discord.File(GTA_VI_LOGO_PATH, filename="gta_vi_logo.png")
+            existing_announcement = await channel.send(
+                content=f"{gta_vi_role.mention} 🌴 **Vice City czeka!**",
+                embed=build_gta_vi_release_embed(),
+                file=file,
+                allowed_mentions=discord.AllowedMentions(
+                    roles=[gta_vi_role],
+                    users=False,
+                    everyone=False
+                )
+            )
+        except (OSError, discord.Forbidden, discord.HTTPException) as error:
+            print(f"❌ Nie udało się wysłać ogłoszenia premiery GTA VI: {error}")
+            return
+
+    await asyncio.to_thread(
+        bot_state_collection.update_one,
+        {"_id": GTA_VI_COUNTDOWN_STATE_ID},
+        {"$set": {
+            "release_announced": True,
+            "release_announcement_message_id": existing_announcement.id,
+            "release_announced_at": now.isoformat()
+        }},
+        upsert=True
+    )
+    print(f"🎉 Ogłoszenie premiery GTA VI: {existing_announcement.id}")
+
+
 @tasks.loop(minutes=2)
 async def rotate_bot_presence():
     global PRESENCE_ROTATION_INDEX
@@ -1034,6 +1137,8 @@ async def update_gta_vi_countdown():
         }},
         upsert=True
     )
+
+    await ensure_gta_vi_release_announcement(channel)
 
 
 @update_gta_vi_countdown.before_loop
@@ -1876,6 +1981,21 @@ GTA_VI_FAREWELL_EXCEPTIONS = {
     498560790714908702: "karmol",
     565784186808434699: "dwu",
     472087271022133249: "exo"
+}
+GTA_VI_FAREWELL_STATE_ID = "gta_vi_farewell_delivery"
+GTA_VI_FAILED_DM_RETRY_DEFAULTS = {
+    418512287234523148: "Wilku",
+    356833167065481218: "Kapisz",
+    344565233366466560: "Jano",
+    802949803545198643: "czajek",
+    1160928857478680707: "kierownik",
+    873235776949850162: "lipsonek",
+    653944835740270592: "szavek",
+    862785469670621265: "kinga",
+    664469607284736003: "kamorti",
+    401802193595793448: "taranek",
+    498560790714908702: "karmol",
+    565784186808434699: "dwu"
 }
 MIN_VC_ATTENDANCE_SECONDS = 35 * 60
 POLISH_WEEKDAYS = (
@@ -8390,6 +8510,19 @@ async def premieragtavi(interaction: discord.Interaction):
             f"Kacieja ({KACIEJ_USER_ID}): {error}"
         )
 
+    await asyncio.to_thread(
+        bot_state_collection.update_one,
+        {"_id": GTA_VI_FAREWELL_STATE_ID},
+        {"$set": {
+            "failed_messages": [
+                {"user_id": user_id, "name": name}
+                for user_id, name, _ in farewell_failed
+            ],
+            "updated_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+        }},
+        upsert=True
+    )
+
     embed = discord.Embed(
         title="🌴 Zmiana ekipy na GTA VI zakończona",
         description=(
@@ -8444,6 +8577,123 @@ async def premieragtavi(interaction: discord.Interaction):
     await send_response(
         interaction,
         embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@bot.tree.command(
+    name="ponowwiadomosci",
+    description="Ponawia niedostarczone wiadomości pożegnalne GTA VI"
+)
+async def ponowwiadomosci(interaction: discord.Interaction):
+    if interaction.user.id != BOSS_USER_ID:
+        await send_response(
+            interaction,
+            "❌ Ta komenda jest dostępna wyłącznie dla właściciela.",
+            ephemeral=True
+        )
+        return
+
+    delivery_state = await asyncio.to_thread(
+        bot_state_collection.find_one,
+        {"_id": GTA_VI_FAREWELL_STATE_ID}
+    )
+    if delivery_state is not None and "failed_messages" in delivery_state:
+        candidates = {
+            int(item["user_id"]): item.get("name", str(item["user_id"]))
+            for item in delivery_state.get("failed_messages", [])
+            if item.get("user_id")
+        }
+    else:
+        candidates = dict(GTA_VI_FAILED_DM_RETRY_DEFAULTS)
+
+    if not candidates:
+        await send_response(
+            interaction,
+            "✅ Wszystkie zapisane wiadomości zostały już dostarczone.",
+            ephemeral=True
+        )
+        return
+
+    delivered = []
+    still_failed = []
+    for user_id, saved_name in candidates.items():
+        if user_id == KACIEJ_USER_ID:
+            message_embed = build_kaciej_farewell_embed()
+        elif user_id in GTA_VI_FAREWELL_EXCEPTIONS:
+            message_embed = build_gta_vi_farewell_embed(include_gta_v_history=True)
+        else:
+            message_embed = build_gta_vi_farewell_embed()
+
+        try:
+            user = bot.get_user(user_id)
+            if user is None:
+                user = await bot.fetch_user(user_id)
+            await user.send(
+                embed=message_embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            delivered.append((user_id, saved_name))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            still_failed.append((user_id, saved_name, str(error)))
+            print(
+                f"⚠️ Ponowna wysyłka do {saved_name} ({user_id}) "
+                f"nie powiodła się: {error}"
+            )
+
+    await asyncio.to_thread(
+        bot_state_collection.update_one,
+        {"_id": GTA_VI_FAREWELL_STATE_ID},
+        {"$set": {
+            "failed_messages": [
+                {"user_id": user_id, "name": name}
+                for user_id, name, _ in still_failed
+            ],
+            "last_retry_at": datetime.now(ZoneInfo("Europe/Warsaw")).isoformat()
+        }},
+        upsert=True
+    )
+
+    result_embed = discord.Embed(
+        title="💌 Ponowna wysyłka wiadomości zakończona",
+        description="Bot ponowił wysyłkę wyłącznie do wcześniej niedostępnych osób.",
+        color=0xF04AA2,
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    result_embed.add_field(
+        name="✅ Tym razem dostarczono",
+        value=f"**{len(delivered)}**",
+        inline=True
+    )
+    result_embed.add_field(
+        name="📪 Nadal niedostarczone",
+        value=f"**{len(still_failed)}**",
+        inline=True
+    )
+    if delivered:
+        result_embed.add_field(
+            name="📬 Otrzymali wiadomość",
+            value="\n".join(
+                f"• **{name}** (`{user_id}`)"
+                for user_id, name in delivered
+            ),
+            inline=False
+        )
+    if still_failed:
+        result_embed.add_field(
+            name="📪 Nadal nie można wysłać",
+            value="\n".join(
+                f"• **{name}** (`{user_id}`)"
+                for user_id, name, _ in still_failed
+            ),
+            inline=False
+        )
+    result_embed.set_footer(text="Kolejne użycie spróbuje tylko z pozostałymi osobami")
+
+    await send_response(
+        interaction,
+        embed=result_embed,
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none()
     )
