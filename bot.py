@@ -8166,15 +8166,19 @@ def build_gta_vi_farewell_embed(include_gta_v_history=False):
             value=(
                 "Dziękujemy za dołożenie własnego kawałka do historii "
                 "**Ekipy Kaciejosa w GTA V** - historii, która przez ostatnie "
-                "**13 lat** tworzyła nasze relacje."
+                "**13 lat** tworzyła nasze relacje.\n\n"
+                "Dziękuję Ci, że stworzyłeś/aś tyle wspomnień, które na zawsze "
+                "pozostaną w głowie, nawet jeżeli obecnie nie posiadamy kontaktu. "
+                "Uważaj na siebie w życiu i powodzenia. 💜"
             ),
             inline=False
         )
-    embed.add_field(
-        name="🎮 NOWY ROZDZIAŁ",
-        value="Od teraz jesteś częścią ekipy **GTA VI**.",
-        inline=False
-    )
+    else:
+        embed.add_field(
+            name="🎮 NOWY ROZDZIAŁ",
+            value="Od teraz jesteś częścią ekipy **GTA VI**.",
+            inline=False
+        )
     embed.add_field(
         name="🌆 NASTĘPNY PRZYSTANEK",
         value="**Widzimy się w Vice City.** 🌴✨",
