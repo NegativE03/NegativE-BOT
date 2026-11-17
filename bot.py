@@ -969,9 +969,9 @@ def get_gta_vi_presence_text():
 async def rotate_bot_presence():
     global PRESENCE_ROTATION_INDEX
     activities = (
+        "🌴 Chillin' in Vice City",
         "KACIEJOS - SERWER NAGRYWKOWY",
-        get_gta_vi_presence_text(),
-        "🌴 Chillin' in Vice City"
+        get_gta_vi_presence_text()
     )
     activity_name = activities[PRESENCE_ROTATION_INDEX % len(activities)]
     PRESENCE_ROTATION_INDEX += 1
@@ -8197,6 +8197,57 @@ def build_gta_vi_farewell_embed(include_gta_v_history=False):
     return embed
 
 
+def build_kaciej_farewell_embed():
+    embed = discord.Embed(
+        title="👑 DZIĘKUJEMY, KACIEJ",
+        description=(
+            "## 💜 Za 13 lat prowadzenia tej ekipy\n"
+            "To dzięki Tobie wszystko się zaczęło. Przez te wszystkie lata "
+            "prowadziłeś ekipę, łączyłeś ludzi i tworzyłeś miejsce, do którego "
+            "chciało się wracać."
+        ),
+        color=0xF04AA2,
+        timestamp=datetime.now(ZoneInfo("Europe/Warsaw"))
+    )
+    embed.add_field(
+        name="🏆 ZA CAŁĄ WSPÓLNĄ HISTORIĘ",
+        value=(
+            "Dziękujemy za każdą nagrywkę, każdą decyzję, cierpliwość oraz "
+            "czas i energię, które przez lata wkładałeś w budowanie i rozwijanie "
+            "swojej ekipy. "
+            "Trzynaście lat to nie tylko liczba - to ogromna część naszego życia."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🫶 ZA LUDZI I WSPOMNIENIA",
+        value=(
+            "Stworzyłeś coś znacznie większego niż ekipę do gry. Powstały relacje, "
+            "przyjaźnie i tysiące wspomnień, które zostaną z nami na zawsze. "
+            "Bez Ciebie nie byłoby tej historii ani nas w tym składzie."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="🌆 KOLEJNY ROZDZIAŁ",
+        value=(
+            "Rozdział GTA V powoli dobiega końca, ale najlepsze może być jeszcze "
+            "przed nami. Obyśmy ponownie spotkali się w tym samym składzie - "
+            "**już na ulicach Vice City.** 🌴✨"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="💜 OD CAŁEJ EKIPY",
+        value="**Dziękujemy za wszystko, Szefie.**",
+        inline=False
+    )
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="NegativE* • 13 lat wspólnej historii • See you in Vice City")
+    return embed
+
+
 @bot.tree.command(
     name="premieragtavi",
     description="Zamienia dotychczasowe role ekipy na rolę GTA VI"
@@ -8286,7 +8337,11 @@ async def premieragtavi(interaction: discord.Interaction):
             print(f"❌ Nie udało się zmienić ról użytkownika {member} ({member.id}): {error}")
 
     farewell_embed = build_gta_vi_farewell_embed()
-    regular_farewell_ids = farewell_member_ids - set(GTA_VI_FAREWELL_EXCEPTIONS)
+    regular_farewell_ids = (
+        farewell_member_ids
+        - set(GTA_VI_FAREWELL_EXCEPTIONS)
+        - {KACIEJ_USER_ID}
+    )
     for member_id in regular_farewell_ids:
         member = affected_members.get(member_id)
         if member is None:
@@ -8318,6 +8373,22 @@ async def premieragtavi(interaction: discord.Interaction):
                 f"⚠️ Nie udało się wysłać specjalnego pożegnania do "
                 f"{saved_name} ({user_id}): {error}"
             )
+
+    try:
+        kaciej = bot.get_user(KACIEJ_USER_ID)
+        if kaciej is None:
+            kaciej = await bot.fetch_user(KACIEJ_USER_ID)
+        await kaciej.send(
+            embed=build_kaciej_farewell_embed(),
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        farewell_sent.append((KACIEJ_USER_ID, "Kaciej"))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+        farewell_failed.append((KACIEJ_USER_ID, "Kaciej", str(error)))
+        print(
+            f"⚠️ Nie udało się wysłać specjalnego podziękowania do "
+            f"Kacieja ({KACIEJ_USER_ID}): {error}"
+        )
 
     embed = discord.Embed(
         title="🌴 Zmiana ekipy na GTA VI zakończona",
