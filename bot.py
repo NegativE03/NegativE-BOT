@@ -970,7 +970,8 @@ async def rotate_bot_presence():
     global PRESENCE_ROTATION_INDEX
     activities = (
         "KACIEJOS - SERWER NAGRYWKOWY",
-        get_gta_vi_presence_text()
+        get_gta_vi_presence_text(),
+        "🌴 Chillin' in Vice City"
     )
     activity_name = activities[PRESENCE_ROTATION_INDEX % len(activities)]
     PRESENCE_ROTATION_INDEX += 1
